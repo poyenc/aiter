@@ -57,6 +57,7 @@ def profile_func(target_func, *args, **kwargs):
         (113, 211),
         (108, 256),
         (256, 512),
+        (256, 256),
         (512, 256),
         (1024, 1024),
         (1023, 1024),
@@ -188,14 +189,17 @@ def test_fmha_v3_fwd_ck(
 
 
 if __name__ == "__main__":
-    batch_size = 1
-    nheads = 1
-    (seqlen_q, seqlen_k) = (256, 32)
+    batch_size = 2
+    nheads = 16
+    common_seqlen = 8192
+    # (seqlen_q, seqlen_k) = (4096, 4096)
+    (seqlen_q, seqlen_k) = (common_seqlen, common_seqlen)
     d = 128
     d_v = 128
     mha_type = "mha"
-    dtype = dtypes.fp16
+    dtype = dtypes.bf16
     seed = 0
+    print(f'b:{batch_size}, h:{nheads}/{nheads}, s={seqlen_q}/{seqlen_k}')
 
     test_fmha_v3_fwd_ck(
         batch_size,
@@ -204,9 +208,10 @@ if __name__ == "__main__":
         seqlen_k,
         d,
         d_v,
-        True,
+        False,
         False,
         mha_type,
         dtype,
         seed,
+        profile=True
     )

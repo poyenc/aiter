@@ -1,5 +1,12 @@
 # aiter version
 aiter/_version.py
+compute-artifactory.amd.com/
+latsqttout2/
+null-*
+pass_2/
+ck_test/
+bg-1w300-g1-2a/
+.rocprofv3/
 
 # Prerequisites
 *.d
