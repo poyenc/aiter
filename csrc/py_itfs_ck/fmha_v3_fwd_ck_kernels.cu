@@ -28,8 +28,8 @@
     asm volatile("; [POYENC] " #marker); \
     __builtin_amdgcn_sched_barrier(0);
 
-#define DEBUG_SINGLE_CASE 0
-#define ADD_SBARRIER_FOR_PHASE0 0
+#define DEBUG_SINGLE_CASE 1
+#define ADD_SBARRIER_FOR_PHASE0 1
 
 namespace aiter {
 
