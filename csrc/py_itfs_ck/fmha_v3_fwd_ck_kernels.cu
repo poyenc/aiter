@@ -38,9 +38,9 @@
 #define DEBUG_MASK_NONE 0
 #define DEBUG_MASK_CAUSAL 1
 
-#define DEBUG_SINGLE_INST 0
-#define DEBUG_SINGLE_INST_DTYPE DEBUG_DTYPE_FP16
-#define DEBUG_SINGLE_INST_MASK DEBUG_MASK_NONE
+#define DEBUG_SINGLE_INST 1
+#define DEBUG_SINGLE_INST_DTYPE DEBUG_DTYPE_BF16
+#define DEBUG_SINGLE_INST_MASK DEBUG_MASK_CAUSAL
 
 #define ENALBE_INLINE_ASM_ELEMWISE_OPS 0
 
@@ -850,20 +850,24 @@ struct BlockFmhaPipelineQRKSVS
                     smem_ptr, Policy::template MakeKLdsStoreBlockDescriptor<Problem>(i_buf));
             },
             number<2>{});
+        static_assert(sizeof(k_lds_window_store(number<0>{})) / 4 == 12);
 
         statically_indexed_array<decltype(make_lds_tile_window<KDataType>(
                                      nullptr,
                                      Policy::template MakeKLdsLoadBlockDescriptor<Problem>())),
                                  2>
             k_lds_window_load;
+        static_assert(sizeof(k_lds_window_load(number<0>{})) / 4 == 12);
 
         statically_indexed_array<decltype(make_lds_tile_window<VDataType>(
                                      nullptr, Policy::template MakeVLdsBlockDescriptor<Problem>())),
                                  2>
             v_lds_window;
+        static_assert(sizeof(v_lds_window(number<0>{})) / 4 == 10);
 
         decltype(make_static_distributed_tensor<QDataType>(
             Policy::template MakeQRegTileDistribution<Problem>())) q_tile;
+        static_assert(q_tile.thread_buf_.size() / 2 == 32);
 
         union kv_tile_type
         {
@@ -877,6 +881,8 @@ struct BlockFmhaPipelineQRKSVS
                 make_tile_window(v_lds_window(number<0>{}),
                                  Policy::template MakeVRegTileDistribution<Problem>()))) v_tile;
         } kv_tile;
+        static_assert(kv_tile.k_tile.thread_buf_.size() == kv_tile.v_tile.thread_buf_.size());
+        static_assert(kv_tile.k_tile.thread_buf_.size() / 2 == 32);
 
         union sp_compute_type
         {
@@ -887,13 +893,17 @@ struct BlockFmhaPipelineQRKSVS
                 tile_elementwise_in(p_compute_element_func, sp_compute))) p;
         };
         statically_indexed_array<sp_compute_type, 2> sp;
+        static_assert(sp(number<0>{}).sp_compute.thread_buf_.size() == 16); // * 2
 
         decltype(gemm_1.MakeCBlockTile()) o_acc;
+        static_assert(o_acc.thread_buf_.size() == 64);
 
         decltype(block_tile_reduce<SMPLComputeDataType>(
             sp(number<0>{}).sp_compute, sequence<1>{}, f_max, SMPLComputeDataType{0})) m;
-        decltype(m) m_local;
         decltype(m) l;
+
+        static_assert(m.thread_buf_.size() == 1);
+        static_assert(l.thread_buf_.size() == 1);
 
         // initialize k_lds_window and v_lds_window
         static_for<0, 2, 1>{}([&](auto idx) {
@@ -954,12 +964,14 @@ struct BlockFmhaPipelineQRKSVS
                              {seqlen_k_start, 0},
                              Policy::template MakeKDramTileDistribution<Problem>());
         k_dram_window.init_raw();
+        static_assert(sizeof(k_dram_window) / 4 == 48);
 
         auto v_dram_window =
             make_tile_window(v_dram_block_window_tmp.get_bottom_tensor_view(),
                              v_dram_block_window_tmp.get_window_lengths(),
                              {seqlen_k_start, 0}, // TODO: hdim split?
                              Policy::template MakeVDramTileDistribution<Problem>());
+        static_assert(sizeof(v_dram_window) / 4 == 48);
 
         const auto bias_origin = bias_dram_block_window_tmp.get_window_origin();
         auto bias_dram_window =
@@ -1115,7 +1127,7 @@ struct BlockFmhaPipelineQRKSVS
                 [&](auto& logits) { logits = detail::mul_impl_sv(scale_s, logits); },
                 sp(sp_reg_idx).sp_compute);
 
-            m_local = block_tile_reduce<SMPLComputeDataType>(
+            auto m_local = block_tile_reduce<SMPLComputeDataType>(
                 sp(sp_reg_idx).sp_compute,
                 sequence<1>{},
                 f_max,
@@ -2923,6 +2935,7 @@ struct FmhaFwdKernel
             else
                 return FmhaMask{kargs.seqlen_q, kargs.seqlen_k};
         }();
+        static_assert(sizeof(mask) / 4 == 4);
 
         // WA i_batch capture structure binding before c++20
         auto position_encoding = [&, i_batch_ = i_batch, i_nhead_ = i_nhead]() {
