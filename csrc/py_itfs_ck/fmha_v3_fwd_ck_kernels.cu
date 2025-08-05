@@ -1064,7 +1064,7 @@ struct BlockFmhaPipelineQRKSVS
                                      Policy::template MakeVLdsLoadBlockDescriptor<Problem>())),
                                  2>
             v_lds_window_load;
-        static_assert(sizeof(v_lds_window_load(number<0>{})) / 4 == 10);
+        static_assert(sizeof(v_lds_window_load(number<0>{})) / 4 == 12);
 
         decltype(make_static_distributed_tensor<QDataType>(
             Policy::template MakeQRegTileDistribution<Problem>())) q_tile;
