@@ -217,7 +217,7 @@ if __name__ == "__main__":
         seqlen_k,
         d,
         d_v,
-        False,
+        True,
         False,
         mha_type,
         dtype,
