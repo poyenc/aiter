@@ -40,11 +40,11 @@
 
 #define DEBUG_SINGLE_INST 1
 #define DEBUG_SINGLE_INST_DTYPE DEBUG_DTYPE_BF16
-#define DEBUG_SINGLE_INST_MASK DEBUG_MASK_CAUSAL
+#define DEBUG_SINGLE_INST_MASK DEBUG_MASK_NONE
 
 #define ENALBE_INLINE_ASM_ELEMWISE_OPS 0
 
-#define ADD_SBARRIER_FOR_PHASE0 0
+#define ADD_SBARRIER_FOR_PHASE0 1
 
 namespace aiter {
 namespace detail {
@@ -98,6 +98,15 @@ CK_TILE_DEVICE float mul_impl_vv(float lhs, float rhs)
 #else
     return lhs * rhs;
 #endif
+}
+
+CK_TILE_DEVICE float fma_impl_vsv(float a, float b, float c)
+{
+    float result;
+    asm volatile("v_fma_f32 %[result], %[a], %[b], %[c]"
+                 : [result] "=v"(result)
+                 : [a] "v"(a), [b] "s"(b), [c] "v"(c));
+    return result;
 }
 } // namespace detail
 
@@ -674,6 +683,129 @@ struct BlockFmhaPipelineQRKSVSDefaultPolicy
     }
 };
 
+template <typename PipelineProblem, bool kIsMasking>
+struct CoreLoopScheduler;
+
+template <typename PipelineProblem>
+struct CoreLoopScheduler<PipelineProblem, /*kIsMasking=*/true>
+{
+    template <ck_tile::index_t WaveGroup, ck_tile::index_t Phase>
+    CK_TILE_DEVICE static constexpr void schedule(ck_tile::number<WaveGroup>,
+                                                  ck_tile::number<Phase>)
+    {
+        using namespace ck_tile;
+
+        if constexpr(WaveGroup == 0)
+        {
+            if constexpr(Phase == 0)
+            {
+                static_for<0, 8, 1>{}([&](auto) {
+                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+                    __builtin_amdgcn_sched_group_barrier(0x002, 3, 0); // VALU
+                });
+                __builtin_amdgcn_sched_group_barrier(0x002, 16, 0); // VALU
+            }
+            else if constexpr(Phase == 1) {}
+            else if constexpr(Phase == 2)
+            {
+                /// FIXME: remove weird v_perm_b32 and re-write following sched_group_barrier()
+                /// calls
+                __builtin_amdgcn_sched_group_barrier(0x002, 4, 0); // VALU
+                static_for<0, 8, 1>{}([&](auto) {
+                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+                    __builtin_amdgcn_sched_group_barrier(0x002, 4, 0); // VALU
+                });
+                __builtin_amdgcn_sched_group_barrier(0x002, 16, 0); // VALU
+            }
+            else if constexpr(Phase == 3) {}
+        }
+        else
+        {
+            if constexpr(Phase == 0) {}
+            else if constexpr(Phase == 1)
+            {
+                static_for<0, 8, 1>{}([&](auto) {
+                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+                    __builtin_amdgcn_sched_group_barrier(0x002, 3, 0); // VALU
+                });
+                __builtin_amdgcn_sched_group_barrier(0x002, 16, 0); // VALU
+            }
+            else if constexpr(Phase == 2) {}
+            else if constexpr(Phase == 3)
+            {
+                /// FIXME: remove weird v_perm_b32 and re-write following sched_group_barrier()
+                /// calls
+                __builtin_amdgcn_sched_group_barrier(0x002, 4, 0); // VALU
+                static_for<0, 8, 1>{}([&](auto) {
+                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+                    __builtin_amdgcn_sched_group_barrier(0x002, 4, 0); // VALU
+                });
+                __builtin_amdgcn_sched_group_barrier(0x002, 16, 0); // VALU
+            }
+        }
+    }
+};
+
+template <typename PipelineProblem>
+struct CoreLoopScheduler<PipelineProblem, /*kIsMasking=*/false>
+{
+    template <ck_tile::index_t WaveGroup, ck_tile::index_t Phase>
+    CK_TILE_DEVICE static constexpr void schedule(ck_tile::number<WaveGroup>,
+                                                  ck_tile::number<Phase>)
+    {
+        using namespace ck_tile;
+
+        if constexpr(WaveGroup == 0)
+        {
+            if constexpr(Phase == 0)
+            {
+                static_for<0, 8, 1>{}([&](auto) {
+                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+                    __builtin_amdgcn_sched_group_barrier(0x002, 3, 0); // VALU
+                });
+                __builtin_amdgcn_sched_group_barrier(0x002, 16, 0); // VALU
+            }
+            else if constexpr(Phase == 1) {}
+            else if constexpr(Phase == 2)
+            {
+                /// FIXME: remove weird v_perm_b32 and re-write following sched_group_barrier()
+                /// calls
+                __builtin_amdgcn_sched_group_barrier(0x002, 4, 0); // VALU
+                static_for<0, 8, 1>{}([&](auto) {
+                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+                    __builtin_amdgcn_sched_group_barrier(0x002, 4, 0); // VALU
+                });
+                __builtin_amdgcn_sched_group_barrier(0x002, 16, 0); // VALU
+            }
+            else if constexpr(Phase == 3) {}
+        }
+        else
+        {
+            if constexpr(Phase == 0) {}
+            else if constexpr(Phase == 1)
+            {
+                static_for<0, 8, 1>{}([&](auto) {
+                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+                    __builtin_amdgcn_sched_group_barrier(0x002, 3, 0); // VALU
+                });
+                __builtin_amdgcn_sched_group_barrier(0x002, 16, 0); // VALU
+            }
+            else if constexpr(Phase == 2) {}
+            else if constexpr(Phase == 3)
+            {
+                /// FIXME: remove weird v_perm_b32 and re-write following sched_group_barrier()
+                /// calls
+                __builtin_amdgcn_sched_group_barrier(0x002, 4, 0); // VALU
+                static_for<0, 8, 1>{}([&](auto) {
+                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+                    __builtin_amdgcn_sched_group_barrier(0x002, 4, 0); // VALU
+                });
+                __builtin_amdgcn_sched_group_barrier(0x002, 16, 0); // VALU
+            }
+        }
+    }
+};
+
 // This pipeline is qkv all located in LDS
 template <typename Problem_, typename Policy_ = BlockFmhaPipelineQRKSVSDefaultPolicy>
 struct BlockFmhaPipelineQRKSVS
@@ -876,84 +1008,6 @@ struct BlockFmhaPipelineQRKSVS
     CK_TILE_DEVICE static constexpr void s_waitcnt_lgkmcnt()
     {
         s_waitcnt<63, Lgkmcnt>();
-    }
-
-    template <ck_tile::index_t WaveGroup, ck_tile::index_t Phase>
-    CK_TILE_DEVICE static constexpr void sched_core_loop(ck_tile::number<WaveGroup> cl_p,
-                                                         ck_tile::number<Phase> phase)
-    {
-        using namespace ck_tile;
-
-        if constexpr(cl_p == 0)
-        {
-            if constexpr(phase == 0)
-            {
-                static_for<0, 8, 1>{}([&](auto) {
-                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
-                    __builtin_amdgcn_sched_group_barrier(0x002, 6, 0); // VALU
-                });
-                __builtin_amdgcn_sched_group_barrier(0x002, 16, 0); // VALU
-            }
-            else if constexpr(phase == 1)
-            {
-                /// NOTICE: unable to schedule fmha_mask() SALUs
-            }
-            else if constexpr(phase == 2)
-            {
-                /// FIXME: remove weird v_perm_b32 and re-write followingsched_group_barrier() calls
-                // __builtin_amdgcn_sched_group_barrier(0x002, 10, 0); // VALU
-                static_for<0, 8, 1>{}([&](auto) {
-                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
-                    __builtin_amdgcn_sched_group_barrier(0x002, 6, 0); // VALU
-                });
-                __builtin_amdgcn_sched_group_barrier(0x002, 16, 0); // VALU
-            }
-            else if constexpr(phase == 3)
-            {
-#if 0
-                static_for<0, 8, 1>{}([&](auto) {
-                    __builtin_amdgcn_sched_group_barrier(0x100, 1, 0); // DS read
-                    __builtin_amdgcn_sched_group_barrier(0x001, 1, 0); // ALU
-                });
-                __builtin_amdgcn_sched_group_barrier(0x001, 16, 0); // ALU
-#endif
-            }
-        }
-        else
-        {
-            if constexpr(phase == 0)
-            {
-#if 0
-                static_for<0, 8, 1>{}([&](auto) {
-                    __builtin_amdgcn_sched_group_barrier(0x100, 1, 0); // DS read
-                    __builtin_amdgcn_sched_group_barrier(0x001, 1, 0); // ALU
-                });
-                __builtin_amdgcn_sched_group_barrier(0x001, 16, 0); // ALU
-#endif
-            }
-            else if constexpr(phase == 1)
-            {
-                static_for<0, 8, 1>{}([&](auto) {
-                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
-                    __builtin_amdgcn_sched_group_barrier(0x002, 6, 0); // VALU
-                });
-                __builtin_amdgcn_sched_group_barrier(0x002, 16, 0); // VALU
-            }
-            else if constexpr(phase == 2)
-            {
-                /// NOTICE: unable to schedule fmha_mask() SALUs
-            }
-            else if constexpr(phase == 3)
-            {
-                /// FIXME: remove weird v_perm_b32 and re-write followingsched_group_barrier() calls
-                // __builtin_amdgcn_sched_group_barrier(0x002, 10, 0); // VALU
-                static_for<0, 8, 1>{}([&](auto) {
-                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
-                    __builtin_amdgcn_sched_group_barrier(0x002, 6, 0); // VALU
-                });
-                __builtin_amdgcn_sched_group_barrier(0x002, 16, 0); // VALU
-            }
-        }
     }
 
     template <typename QDramBlockWindowTmp,
@@ -1301,6 +1355,8 @@ struct BlockFmhaPipelineQRKSVS
 
         decltype(m) m_old;
         SMPLComputeDataType o_acc_scale; // rescale o_acc in fmha_alu1() & fmha_alu_D_upd()
+        /// TODO: remove the sp_delta and use sp_compute directly
+        statically_indexed_array<decltype(sp(number<0>{}).sp_compute), 2> sp_delta;
 
         auto fmha_alu0 = [&](auto sp_reg_idx) {
             m_old = m; // m{j-1}
@@ -1322,6 +1378,17 @@ struct BlockFmhaPipelineQRKSVS
             block_tile_reduce_sync(m_latest, f_max, bool_constant<false>{});
 #endif
             m = m_latest;
+
+            constexpr auto p_spans =
+                std::decay_t<decltype(sp(sp_reg_idx).sp_compute)>::get_distributed_spans();
+            sweep_tile_span(p_spans[number<0>{}], [&](auto idx0) {
+                constexpr auto i_idx = make_tuple(idx0);
+                sweep_tile_span(p_spans[number<1>{}], [&](auto idx1) {
+                    constexpr auto i_j_idx        = make_tuple(idx0, idx1);
+                    sp_delta(sp_reg_idx)(i_j_idx) = detail::fma_impl_vsv(
+                        sp(sp_reg_idx).sp_compute(i_j_idx), scale_s, -scale_s * m(i_j_idx));
+                });
+            });
             /// TODO: move some fmha_alu1() code here if necessary
         };
 
@@ -1331,9 +1398,9 @@ struct BlockFmhaPipelineQRKSVS
             sweep_tile_span(p_spans[number<0>{}], [&](auto idx0) {
                 constexpr auto i_idx = make_tuple(idx0);
                 sweep_tile_span(p_spans[number<1>{}], [&](auto idx1) {
-                    constexpr auto i_j_idx             = make_tuple(idx0, idx1);
-                    sp(sp_reg_idx).sp_compute(i_j_idx) = ck_tile::exp2(
-                        scale_s * sp(sp_reg_idx).sp_compute[i_j_idx] - scale_s * m[i_idx]);
+                    constexpr auto i_j_idx = make_tuple(idx0, idx1);
+                    sp(sp_reg_idx).sp_compute(i_j_idx) =
+                        ck_tile::exp2(sp_delta(sp_reg_idx)(i_j_idx));
                 });
             });
 
@@ -1473,6 +1540,8 @@ struct BlockFmhaPipelineQRKSVS
             auto memV = number<0>{};
             auto memK = number<1>{};
 
+            using Scheduler = CoreLoopScheduler<Problem, FmhaMask::IsMasking>;
+
             auto iteration = [&](auto pi) {
                 auto xdl_SP_p01_reg_idx = number<1>{} - pi;
                 auto xdl_SP_p23_reg_idx = pi;
@@ -1510,7 +1579,7 @@ struct BlockFmhaPipelineQRKSVS
                     cl_calc(xdl_SP_p01_reg_idx, gemm0);
                     fmha_alu1(xdl_SP_p23_reg_idx);
 
-                    sched_core_loop(cl_p, number<0>{});
+                    Scheduler::schedule(cl_p, number<0>{});
                     __builtin_amdgcn_sched_barrier(0);
                     // phase1
                     ASM_MARKER("phase1 Wave0-3");
@@ -1521,7 +1590,7 @@ struct BlockFmhaPipelineQRKSVS
                     cl_load(memK, K_w0_lds_wr_idx, V_w0_lds_rd_idx);
                     fmha_mask(xdl_SP_p01_reg_idx);
 
-                    sched_core_loop(cl_p, number<1>{});
+                    Scheduler::schedule(cl_p, number<1>{});
                     __builtin_amdgcn_sched_barrier(0);
                     // phase2
                     ASM_MARKER("phase2 Wave0-3");
@@ -1531,7 +1600,7 @@ struct BlockFmhaPipelineQRKSVS
                     __builtin_amdgcn_sched_barrier(0);
                     cl_calc(xdl_SP_p23_reg_idx, gemm1);
 
-                    sched_core_loop(cl_p, number<2>{});
+                    Scheduler::schedule(cl_p, number<2>{});
                     __builtin_amdgcn_sched_barrier(0);
                     fmha_alu_D_upd();
 
@@ -1544,7 +1613,7 @@ struct BlockFmhaPipelineQRKSVS
                     __builtin_amdgcn_sched_barrier(0);
                     cl_load(memV, V_w0_lds_wr_idx, K_w0_lds_rd_idx);
 
-                    sched_core_loop(cl_p, number<3>{});
+                    Scheduler::schedule(cl_p, number<3>{});
                     kv_token_start += kN0;
                     if(num_total_loop <= ++i_total_loops)
                     {
@@ -1569,7 +1638,7 @@ struct BlockFmhaPipelineQRKSVS
                     }
                     cl_load(memV, V_w4_lds_wr_idx, K_w4_lds_rd_idx);
 
-                    sched_core_loop(cl_p, number<0>{});
+                    Scheduler::schedule(cl_p, number<0>{});
                     __builtin_amdgcn_sched_barrier(0);
                     // phase1
                     ASM_MARKER("phase1 Wave4-7");
@@ -1580,7 +1649,7 @@ struct BlockFmhaPipelineQRKSVS
                     cl_calc(xdl_SP_p01_reg_idx, gemm0);
                     fmha_alu1(xdl_SP_p23_reg_idx);
 
-                    sched_core_loop(cl_p, number<1>{});
+                    Scheduler::schedule(cl_p, number<1>{});
                     __builtin_amdgcn_sched_barrier(0);
                     // phase2
                     ASM_MARKER("phase2 Wave4-7");
@@ -1589,7 +1658,7 @@ struct BlockFmhaPipelineQRKSVS
                     cl_load(memK, K_w4_lds_wr_idx, V_w4_lds_rd_idx);
                     fmha_mask(xdl_SP_p01_reg_idx);
 
-                    sched_core_loop(cl_p, number<2>{});
+                    Scheduler::schedule(cl_p, number<2>{});
                     kv_token_start += kN0;
                     if(num_total_loop <= ++i_total_loops)
                     {
@@ -1605,7 +1674,7 @@ struct BlockFmhaPipelineQRKSVS
                     __builtin_amdgcn_sched_barrier(0);
                     cl_calc(xdl_SP_p23_reg_idx, gemm1);
 
-                    sched_core_loop(cl_p, number<3>{});
+                    Scheduler::schedule(cl_p, number<3>{});
                     __builtin_amdgcn_sched_barrier(0);
                     fmha_alu_D_upd();
                 }
@@ -1689,7 +1758,7 @@ struct BlockFmhaPipelineQRKSVS
                 while(core_loop(number<0>{}))
                     ;
             }
-            else
+            if(warp_group_id != 0)
             {
                 asm volatile("s_setprio 1");
                 __builtin_amdgcn_s_barrier();
@@ -1700,14 +1769,12 @@ struct BlockFmhaPipelineQRKSVS
     label_main_loops_exit:
         if(num_total_loop % 2)
         {
-            goto label_odd64_tail;
+            fmha_post_process(number<1>{});
         }
-
-        fmha_post_process(number<0>{});
-        goto label_write_out;
-
-    label_odd64_tail:
-        fmha_post_process(number<1>{});
+        if(!(num_total_loop % 2))
+        {
+            fmha_post_process(number<0>{});
+        }
 
     label_write_out:
         // store lse
@@ -3026,7 +3093,7 @@ struct host_args
 };
 
 //////////////////////////////////////////////////////////////////////////////////////
-template <typename DataType, bool IsMasking>
+template <typename DataType, bool PadSeqlen, bool IsMasking>
 struct get_kernel
 {
     using fmha_dtype = DataType;
@@ -3045,11 +3112,11 @@ struct get_kernel
                                               true // IsVLayoutRowMajor
                                               >;
 
-    using fmha_traits = ck_tile::TileFmhaTraits<true,  // kPadSeqLenQ
-                                                true,  // kPadSeqLenK
-                                                false, // kPadHeadDimQ
-                                                false, // kPadHeadDimV
-                                                false, // kHasLogitsSoftCap
+    using fmha_traits = ck_tile::TileFmhaTraits<PadSeqlen, // kPadSeqLenQ
+                                                PadSeqlen, // kPadSeqLenK
+                                                false,     // kPadHeadDimQ
+                                                false,     // kPadHeadDimV
+                                                false,     // kHasLogitsSoftCap
                                                 ck_tile::BlockAttentionBiasEnum::NO_BIAS,
                                                 false, // kHasBiasGrad
                                                 false, // kStoreLSE
@@ -3096,8 +3163,8 @@ struct get_kernel
     using type = aiter::FmhaFwdKernel<fmha_pipeline, fmha_epilogue>;
 };
 
-template <typename DataType, bool IsMasking>
-using get_kernel_t = typename get_kernel<DataType, IsMasking>::type;
+template <typename DataType, bool PadSeqlen, bool IsMasking>
+using get_kernel_t = typename get_kernel<DataType, PadSeqlen, IsMasking>::type;
 
 template <typename Kernel>
 void launch(const host_args& args)
@@ -3284,14 +3351,34 @@ std::vector<at::Tensor> fmha_v3_fwd_ck(const at::Tensor& q, // [b, sq, hq, d]
         {
 #if !DEBUG_SINGLE_INST || \
     (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_FP16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_NONE)
-            launch<get_kernel_t<FmhaFwdFp16, false>>(args);
+#if 0
+            if(seqlen_q % 256 == 0 && seqlen_k % 32 == 0)
+            {
+                launch<get_kernel_t<FmhaFwdFp16, false, false>>(args);
+            }
+            else
+            {
+                launch<get_kernel_t<FmhaFwdFp16, true, false>>(args);
+            }
+#endif
+            launch<get_kernel_t<FmhaFwdFp16, true, false>>(args);
 #endif
         }
         else
         {
 #if !DEBUG_SINGLE_INST || \
     (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_FP16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_CAUSAL)
-            launch<get_kernel_t<FmhaFwdFp16, true>>(args);
+#if 0
+            if(seqlen_q % 256 == 0 && seqlen_k % 32 == 0)
+            {
+                launch<get_kernel_t<FmhaFwdFp16, false, true>>(args);
+            }
+            else
+            {
+                launch<get_kernel_t<FmhaFwdFp16, true, true>>(args);
+            }
+#endif
+            launch<get_kernel_t<FmhaFwdFp16, true, true>>(args);
 #endif
         }
     }
@@ -3301,14 +3388,34 @@ std::vector<at::Tensor> fmha_v3_fwd_ck(const at::Tensor& q, // [b, sq, hq, d]
         {
 #if !DEBUG_SINGLE_INST || \
     (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_BF16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_NONE)
-            launch<get_kernel_t<FmhaFwdBf16, false>>(args);
+#if 0
+            if(seqlen_q % 256 == 0 && seqlen_k % 32 == 0)
+            {
+                launch<get_kernel_t<FmhaFwdBf16, false, false>>(args);
+            }
+            else
+            {
+                launch<get_kernel_t<FmhaFwdBf16, true, false>>(args);
+            }
+#endif
+            launch<get_kernel_t<FmhaFwdBf16, true, false>>(args);
 #endif
         }
         else
         {
 #if !DEBUG_SINGLE_INST || \
     (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_BF16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_CAUSAL)
-            launch<get_kernel_t<FmhaFwdBf16, true>>(args);
+#if 0
+            if(seqlen_q % 256 == 0 && seqlen_k % 32 == 0)
+            {
+                launch<get_kernel_t<FmhaFwdBf16, false, true>>(args);
+            }
+            else
+            {
+                launch<get_kernel_t<FmhaFwdBf16, true, true>>(args);
+            }
+#endif
+            launch<get_kernel_t<FmhaFwdBf16, true, true>>(args);
 #endif
         }
     }
