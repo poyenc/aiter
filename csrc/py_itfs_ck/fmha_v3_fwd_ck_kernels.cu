@@ -38,7 +38,7 @@
 #define DEBUG_MASK_NONE 0
 #define DEBUG_MASK_CAUSAL 1
 
-#define DEBUG_SINGLE_INST 0
+#define DEBUG_SINGLE_INST 1
 #define DEBUG_SINGLE_INST_DTYPE DEBUG_DTYPE_BF16
 #define DEBUG_SINGLE_INST_MASK DEBUG_MASK_NONE
 
@@ -3133,6 +3133,7 @@ struct get_kernel
         false, // kIsGroupMode
         fmha_variant,
         fmha_mask,
+        false,
         fmha_traits>;
 
     using fmha_pipeline = aiter::BlockFmhaPipelineQRKSVS<fmha_problem>;
