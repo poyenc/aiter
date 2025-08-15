@@ -1396,7 +1396,7 @@ struct BlockFmhaPipelineQRKSVS
             auto rowsum_p = block_tile_reduce<SMPLComputeDataType>(
                 sp(sp_reg_idx).sp_compute,
                 sequence<1>{},
-                f_sum,
+                [](auto e0, auto e1) { return e0 + e1; },
                 SMPLComputeDataType{0}); // rowsum(Pcompute{j})
             static_assert(rowsum_p.thread_buf_.size() == 1,
                           "assuming that each thread holds 1 rowsum value");
@@ -1407,10 +1407,11 @@ struct BlockFmhaPipelineQRKSVS
                                                  bit_cast<int32_t>(rowsum_p.thread_buf_[0]),
                                                  false,
                                                  false);
-            rowsum_p.thread_buf_[0] = f_sum(bit_cast<SMPLComputeDataType>(swapped_regs.x),
-                                            bit_cast<SMPLComputeDataType>(swapped_regs.y));
+            rowsum_p.thread_buf_[0] = bit_cast<SMPLComputeDataType>(swapped_regs.x) +
+                                      bit_cast<SMPLComputeDataType>(swapped_regs.y);
 #else
-            block_tile_reduce_sync(rowsum_p, f_sum, bool_constant<false>{});
+            block_tile_reduce_sync(
+                rowsum_p, [](auto e0, auto e1) { return e0 + e1; }, bool_constant<false>{});
 #endif
             // update partial o_acc [0, 2)
             static_for<0, ck_tile::min(2, fmha_alu_D_reg_cnt), 1>{}(
