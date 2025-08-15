@@ -224,19 +224,19 @@ if __name__ == "__main__":
 
     problem_sizes = [
         # batch_size, (nheads, nheads_k), (seqlen_q, seqlen_k), (d, d_v)
-        ProblemSize(32, (16,), (512,), (128,)),
-        ProblemSize(16, (16,), (1024,), (128,)),
-        ProblemSize(8, (16,), (2048,), (128,)),
-        ProblemSize(4, (16,), (4096,), (128,)),
-        ProblemSize(2, (16,), (8192,), (128,)),
-        ProblemSize(1, (16,), (16384,), (128,)),
-        ProblemSize(1, (64,), (16384,), (128,)),
-        ProblemSize(1, (16, 1), (65536,), (128,)),
-        ProblemSize(1, (40,), (37200,), (128,)),
+        # ProblemSize(32, (16,), (512,), (128,)),
+        # ProblemSize(16, (16,), (1024,), (128,)),
+        # ProblemSize(8, (16,), (2048,), (128,)),
+        # ProblemSize(4, (16,), (4096,), (128,)),
+        # ProblemSize(2, (16,), (8192,), (128,)),
+         ProblemSize(1, (16,), (16384,), (128,)),
+        # ProblemSize(1, (64,), (16384,), (128,)),
+        # ProblemSize(1, (16, 1), (65536,), (128,)),
+        # ProblemSize(1, (40,), (37200,), (128,)),
     ]
 
     for dtype, problem_size in itertools.product(
-        [dtypes.fp16, dtypes.bf16], problem_sizes
+        [dtypes.bf16], problem_sizes
     ):
         batch_size = problem_size.batch_size
         nheads, nheads_k = (
