@@ -1503,7 +1503,7 @@ struct BlockFmhaPipelineQRKSVS
                 while(core_loop(number<0>{}))
                     ;
             }
-            else
+            if(warp_group_id != 0)
             {
                 asm volatile("s_setprio 1");
                 __builtin_amdgcn_s_barrier();
@@ -1514,14 +1514,12 @@ struct BlockFmhaPipelineQRKSVS
     label_main_loops_exit:
         if(num_total_loop % 2)
         {
-            goto label_odd64_tail;
+            fmha_post_process(number<1>{});
         }
-
-        fmha_post_process(number<0>{});
-        goto label_write_out;
-
-    label_odd64_tail:
-        fmha_post_process(number<1>{});
+        if(!(num_total_loop % 2))
+        {
+            fmha_post_process(number<0>{});
+        }
 
     label_write_out:
         // store lse
