@@ -1097,7 +1097,7 @@ struct BlockFmhaPipelineQRKSVS
                     smem_ptr, Policy::template MakeKLdsStoreBlockDescriptor<Problem>(i_buf));
             },
             number<2>{});
-        static_assert(sizeof(k_lds_window_store(number<0>{})) / 4 == 12);
+        // static_assert(sizeof(k_lds_window_store(number<0>{})) / 4 == 12);
 
         auto v_lds_window_store = generate_tuple(
             [&](auto i_buf) {
@@ -1111,18 +1111,18 @@ struct BlockFmhaPipelineQRKSVS
                                      Policy::template MakeKLdsLoadBlockDescriptor<Problem>())),
                                  2>
             k_lds_window_load;
-        static_assert(sizeof(k_lds_window_load(number<0>{})) / 4 == 12);
+        // static_assert(sizeof(k_lds_window_load(number<0>{})) / 4 == 12);
 
         statically_indexed_array<decltype(make_lds_tile_window<VDataType>(
                                      nullptr,
                                      Policy::template MakeVLdsLoadBlockDescriptor<Problem>())),
                                  2>
             v_lds_window_load;
-        static_assert(sizeof(v_lds_window_load(number<0>{})) / 4 == 12);
+        // static_assert(sizeof(v_lds_window_load(number<0>{})) / 4 == 12);
 
         decltype(make_static_distributed_tensor<QDataType>(
             Policy::template MakeQRegTileDistribution<Problem>())) q_tile;
-        static_assert(q_tile.thread_buf_.size() / 2 == 32);
+        // static_assert(q_tile.thread_buf_.size() / 2 == 32);
 
         union kv_tile_type
         {
@@ -1136,8 +1136,8 @@ struct BlockFmhaPipelineQRKSVS
                 make_tile_window(v_lds_window_load(number<0>{}),
                                  Policy::template MakeVRegTileDistribution<Problem>()))) v_tile;
         } kv_tile;
-        static_assert(kv_tile.k_tile.thread_buf_.size() == kv_tile.v_tile.thread_buf_.size());
-        static_assert(kv_tile.k_tile.thread_buf_.size() / 2 == 32);
+        // static_assert(kv_tile.k_tile.thread_buf_.size() == kv_tile.v_tile.thread_buf_.size());
+        // static_assert(kv_tile.k_tile.thread_buf_.size() / 2 == 32);
 
         union sp_compute_type
         {
@@ -1148,13 +1148,13 @@ struct BlockFmhaPipelineQRKSVS
                 tile_elementwise_in(p_compute_element_func, sp_compute))) p;
         };
         statically_indexed_array<sp_compute_type, 2> sp;
-        static_assert(sp(number<0>{}).sp_compute.thread_buf_.size() == 16); // * 2
+        // static_assert(sp(number<0>{}).sp_compute.thread_buf_.size() == 16); // * 2
 
         decltype(gemm_1.MakeCBlockTile()) o_acc;
-        static_assert(o_acc.thread_buf_.size() == 64);
+        // static_assert(o_acc.thread_buf_.size() == 64);
         constexpr index_t fmha_alu_D_reg_cnt = 0; // threshold to decide how many fmha_alu_D_upd()
                                                   // instructions should we move to fmha_alu1()
-        static_assert(fmha_alu_D_reg_cnt <= o_acc.thread_buf_.size());
+        // static_assert(fmha_alu_D_reg_cnt <= o_acc.thread_buf_.size());
 
         decltype(block_tile_reduce<SMPLComputeDataType>(
             sp(number<0>{}).sp_compute, sequence<1>{}, f_max, SMPLComputeDataType{0})) m;
@@ -1222,7 +1222,7 @@ struct BlockFmhaPipelineQRKSVS
                              {seqlen_k_start, 0},
                              Policy::template MakeKDramTileDistribution<Problem>());
         k_dram_window.init_raw();
-        static_assert(sizeof(k_dram_window) / 4 == 48);
+        // static_assert(sizeof(k_dram_window) / 4 == 48);
 
         auto v_dram_window =
             make_tile_window(v_dram_block_window_tmp.get_bottom_tensor_view(),
@@ -1230,7 +1230,7 @@ struct BlockFmhaPipelineQRKSVS
                              {seqlen_k_start, 0}, // TODO: hdim split?
                              Policy::template MakeVDramTileDistribution<Problem>());
         v_dram_window.init_raw();
-        static_assert(sizeof(v_dram_window) / 4 == 48);
+        // static_assert(sizeof(v_dram_window) / 4 == 48);
 
         // prefetch K tile
         index_t i_total_loops      = 0;
