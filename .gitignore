@@ -49,3 +49,17 @@ __pycache__
 debug
 aiter_logs
 *.log
+.rocprofv3/
+aiter/install_mode
+ck_test/
+debug.txt
+latsqttout2/
+null-hip-amdgcn-amd-amdhsa-gfx950.bc
+null-hip-amdgcn-amd-amdhsa-gfx950.hipi
+null-hip-amdgcn-amd-amdhsa-gfx950.out.resolution.txt
+null-hip-amdgcn-amd-amdhsa-gfx950.s
+null-hip-amdgcn-amd-amdhsa.hipfb
+null-host-x86_64-unknown-linux-gnu.bc
+null-host-x86_64-unknown-linux-gnu.hipi
+null-host-x86_64-unknown-linux-gnu.s
+pass_2/
