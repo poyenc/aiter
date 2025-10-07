@@ -159,7 +159,7 @@ def test_fmha_v3_fwd_ck(
     if profile:
         return
 
-    _strict = False
+    _strict = True
 
     if _strict:
         out_ref = run_torch(q, k, v, causal=causal)
