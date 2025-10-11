@@ -691,7 +691,8 @@
             "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
             "'--save-temps'",
             "'-mllvm --greedy-reverse-local-assignment'",
-            "'-mllvm --amdgpu-codegenprepare-break-large-phis=0'"
+            "'-mllvm --amdgpu-codegenprepare-break-large-phis=0'",
+            "'-mllvm --amdgpu-packedfp32-are-2valu'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
