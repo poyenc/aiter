@@ -340,7 +340,8 @@ def build_module(
         if hip_version > Version("5.7.23302"):
             flags_hip += ["-fno-offload-uniform-block"]
         if hip_version > Version("6.1.40090"):
-            flags_hip += ["-mllvm -enable-post-misched=0"]
+            # flags_hip += ["-mllvm -enable-post-misched=0"]
+            pass
         if hip_version > Version("6.2.41132"):
             flags_hip += [
                 "-mllvm -amdgpu-early-inline-all=true",
