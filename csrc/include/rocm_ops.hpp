@@ -1382,3 +1382,25 @@ namespace py = pybind11;
           py::arg("reduce_partial_map"), \
           py::arg("final_output"),       \
           py::arg("final_lse") = std::nullopt);
+
+#define MHA_V3_FWD_CK_PYBIND                  \
+    m.def("fmha_v3_fwd_ck",                   \
+          &aiter::torch_itfs::fmha_v3_fwd_ck, \
+          py::arg("q"),                       \
+          py::arg("k"),                       \
+          py::arg("v"),                       \
+          py::arg("softmax_scale"),           \
+          py::arg("is_causal"));
+
+#define MHA_V3_VARLEN_FWD_CK_PYBIND                  \
+    m.def("fmha_v3_varlen_fwd_ck",                   \
+          &aiter::torch_itfs::fmha_v3_varlen_fwd_ck, \
+          py::arg("q"),                              \
+          py::arg("k"),                              \
+          py::arg("v"),                              \
+          py::arg("cu_seqlens_q"),                   \
+          py::arg("cu_seqlens_k"),                   \
+          py::arg("max_seqlen_q"),                   \
+          py::arg("max_seqlen_k"),                   \
+          py::arg("softmax_scale"),                  \
+          py::arg("is_causal"));

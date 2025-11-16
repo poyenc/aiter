@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 from torch import Generator, Tensor
@@ -2774,3 +2774,99 @@ def flash_attn_varlen_fp8_pertensor_func(
     )
     out = out_padded[..., :head_size_v_og]
     return out
+
+
+@compile_ops("module_fmha_v3_fwd_ck", fc_name="fmha_v3_fwd_ck")
+def fmha_v3_fwd_ck(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    is_causal: bool,
+) -> List[Tensor]: ...
+
+
+@compile_ops("module_fmha_v3_varlen_fwd_ck", fc_name="fmha_v3_varlen_fwd_ck")
+def fmha_v3_varlen_fwd_ck(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    is_causal: bool,
+) -> List[Tensor]: ...
+
+
+def fmha_v3_fwd_ck_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale=None,
+    causal: bool = False,
+):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    head_size_q_og = q.size(3)
+    head_size_v_og = v.size(3)
+    if head_size_q_og % 8 != 0:
+        q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
+        k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
+    if head_size_v_og % 8 != 0:
+        v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
+
+    out_padded = fmha_v3_fwd_ck(
+        q,
+        k,
+        v,
+        softmax_scale,
+        is_causal=causal,
+    )[0]
+    out = out_padded[..., :head_size_v_og]
+
+    result = [out]
+
+    return result[0] if len(result) == 1 else tuple(result)
+
+
+def fmha_v3_varlen_fwd_ck_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale=None,
+    causal: bool = False,
+):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    head_size_q_og = q.size(-1)
+    head_size_v_og = v.size(-1)
+    if head_size_q_og % 8 != 0:
+        q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
+        k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
+    if head_size_v_og % 8 != 0:
+        v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
+
+    out_padded = fmha_v3_varlen_fwd_ck(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        is_causal=causal,
+    )[0]
+    out = out_padded[..., :head_size_v_og]
+
+    result = [out]
+
+    return result[0] if len(result) == 1 else tuple(result)

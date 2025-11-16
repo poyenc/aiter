@@ -154,7 +154,8 @@ def test_fmha_v3_fwd_ck(
     # print_tensor(k.squeeze(0).squeeze(1), 'K')
     # print_tensor(v.squeeze(0).squeeze(1), 'V')
 
-    attention = aiter.flash_attn_func
+    # attention = aiter.flash_attn_func
+    attention = aiter.fmha_v3_fwd_ck_func
     if profile:
         out, time = profile_func(attention, q, k, v, causal=causal)
         tflops = efficiency(flops(batch_size, seqlen_q, d, nheads, causal), time)
