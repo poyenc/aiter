@@ -21,6 +21,7 @@ std::vector<at::Tensor> fmha_v3_varlen_fwd_ck(const at::Tensor& q,            //
                                               int max_seqlen_q,
                                               int max_seqlen_k,
                                               float softmax_scale,
+                                              float logits_soft_cap,
                                               bool is_causal)
 {
     auto q_dtype = q.dtype();
@@ -85,7 +86,7 @@ std::vector<at::Tensor> fmha_v3_varlen_fwd_ck(const at::Tensor& q,            //
                            q_dtype_str,
                            true,
                            true,
-                           false,
+                           0.f < logits_soft_cap,
                            mask.type,
                            bias_enum::no_bias,
                            false,
@@ -101,7 +102,8 @@ std::vector<at::Tensor> fmha_v3_varlen_fwd_ck(const at::Tensor& q,            //
     args.nhead_q      = num_heads;
     args.nhead_k      = num_heads_k;
 
-    args.scale_s = softmax_scale;
+    args.scale_s         = softmax_scale;
+    args.logits_soft_cap = logits_soft_cap;
 
     args.seqstart_q_ptr  = cu_seqlens_q.data_ptr();
     args.seqstart_k_ptr  = cu_seqlens_k.data_ptr();

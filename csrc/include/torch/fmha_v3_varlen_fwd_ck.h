@@ -13,6 +13,7 @@ std::vector<at::Tensor> fmha_v3_varlen_fwd_ck(const at::Tensor& q,            //
                                               int max_seqlen_q,
                                               int max_seqlen_k,
                                               float softmax_scale,
+                                              float logits_soft_cap,
                                               bool is_causal);
 } // namespace torch_itfs
 } // namespace aiter

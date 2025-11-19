@@ -17,6 +17,7 @@ std::vector<at::Tensor> fmha_v3_fwd_ck(const at::Tensor& q, // [b, sq, hq, d]
                                        const at::Tensor& k, // [b, sk, hk, d]
                                        const at::Tensor& v, // [b, sk, hk, d_v]
                                        float softmax_scale,
+                                       float logits_soft_cap,
                                        bool is_causal)
 {
     auto q_dtype = q.dtype();
@@ -81,7 +82,7 @@ std::vector<at::Tensor> fmha_v3_fwd_ck(const at::Tensor& q, // [b, sq, hq, d]
                            q_dtype_str,
                            false,
                            true,
-                           false,
+                           0.f < logits_soft_cap,
                            mask.type,
                            bias_enum::no_bias,
                            false,
@@ -99,7 +100,8 @@ std::vector<at::Tensor> fmha_v3_fwd_ck(const at::Tensor& q, // [b, sq, hq, d]
     args.nhead_q      = num_heads;
     args.nhead_k      = num_heads_k;
 
-    args.scale_s = softmax_scale;
+    args.scale_s         = softmax_scale;
+    args.logits_soft_cap = logits_soft_cap;
 
     args.seqstart_q_ptr  = nullptr;
     args.seqstart_k_ptr  = nullptr;

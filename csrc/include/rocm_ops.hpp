@@ -1480,6 +1480,7 @@ namespace py = pybind11;
           py::arg("k"),                       \
           py::arg("v"),                       \
           py::arg("softmax_scale"),           \
+          py::arg("logits_soft_cap"),         \
           py::arg("is_causal"));
 
 #define MHA_V3_VARLEN_FWD_CK_PYBIND                  \
@@ -1493,4 +1494,5 @@ namespace py = pybind11;
           py::arg("max_seqlen_q"),                   \
           py::arg("max_seqlen_k"),                   \
           py::arg("softmax_scale"),                  \
+          py::arg("logits_soft_cap"),                \
           py::arg("is_causal"));

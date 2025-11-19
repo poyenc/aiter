@@ -2850,6 +2850,7 @@ def fmha_v3_fwd_ck(
     k: torch.Tensor,
     v: torch.Tensor,
     softmax_scale: float,
+    logits_soft_cap: float,
     is_causal: bool,
 ) -> List[Tensor]: ...
 
@@ -2864,6 +2865,7 @@ def fmha_v3_varlen_fwd_ck(
     max_seqlen_q: int,
     max_seqlen_k: int,
     softmax_scale: float,
+    logits_soft_cap: float,
     is_causal: bool,
 ) -> List[Tensor]: ...
 
@@ -2872,7 +2874,8 @@ def fmha_v3_fwd_ck_func(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    softmax_scale=None,
+    softmax_scale: float = None,
+    logits_soft_cap: float = 0.0,
     causal: bool = False,
 ):
     if softmax_scale is None:
@@ -2891,6 +2894,7 @@ def fmha_v3_fwd_ck_func(
         k,
         v,
         softmax_scale,
+        logits_soft_cap=logits_soft_cap,
         is_causal=causal,
     )[0]
     out = out_padded[..., :head_size_v_og]
@@ -2908,7 +2912,8 @@ def fmha_v3_varlen_fwd_ck_func(
     cu_seqlens_k: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
-    softmax_scale=None,
+    softmax_scale: float = None,
+    logits_soft_cap: float = 0.0,
     causal: bool = False,
 ):
     if softmax_scale is None:
@@ -2931,6 +2936,7 @@ def fmha_v3_varlen_fwd_ck_func(
         max_seqlen_q,
         max_seqlen_k,
         softmax_scale,
+        logits_soft_cap=logits_soft_cap,
         is_causal=causal,
     )[0]
     out = out_padded[..., :head_size_v_og]
