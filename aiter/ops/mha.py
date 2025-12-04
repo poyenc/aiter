@@ -18,6 +18,7 @@ def cmdGenFunc_mha_fwd(
     v: Tensor,
     dropout_p: float,
     softmax_scale: float,
+    logits_soft_cap: float,
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
@@ -53,6 +54,12 @@ def cmdGenFunc_mha_fwd(
             filter += "fp8bf16*"
         else:
             raise NotImplementedError("Unsupported output dtype for FP8 MHA")
+    if 0.0 < logits_soft_cap:
+        md_name += "_logits"
+        filter += "_logits*"
+    else:
+        md_name += "_nlogits"
+        filter += "_nlogits*"
     if bias is not None:
         md_name += "_bias"
         filter += "_bias*"
@@ -193,6 +200,7 @@ def mha_fwd(
     v: Tensor,
     dropout_p: float,
     softmax_scale: float,
+    logits_soft_cap: float,
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
@@ -1208,6 +1216,7 @@ def _flash_attn_forward(
     v: torch.Tensor,
     dropout_p: float,
     softmax_scale: float,
+    logits_soft_cap: float,
     causal: bool,
     window_size_left: int,
     window_size_right: int,
@@ -1285,6 +1294,7 @@ def _flash_attn_forward(
             v,
             dropout_p,
             softmax_scale,
+            logits_soft_cap,
             causal,
             window_size_left,
             window_size_right,
@@ -1674,6 +1684,7 @@ class FlashAttnFunc(torch.autograd.Function):
         v,
         dropout_p,
         softmax_scale,
+        logits_soft_cap,
         causal,
         window_size,
         bias,
@@ -1703,6 +1714,7 @@ class FlashAttnFunc(torch.autograd.Function):
             v,
             dropout_p,
             softmax_scale,
+            logits_soft_cap=logits_soft_cap,
             causal=causal,
             window_size_left=int(window_size[0]),
             window_size_right=int(window_size[1]),
@@ -1823,6 +1835,7 @@ def flash_attn_func(
     v,
     dropout_p=0.0,
     softmax_scale=None,
+    logits_soft_cap=0.0,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     bias=None,
@@ -1891,6 +1904,7 @@ def flash_attn_func(
         v,
         dropout_p,
         softmax_scale,
+        logits_soft_cap,
         causal,
         window_size,
         bias,

@@ -677,6 +677,7 @@ namespace py = pybind11;
           py::arg("v"),                            \
           py::arg("dropout_p"),                    \
           py::arg("softmax_scale"),                \
+          py::arg("logits_soft_cap"),              \
           py::arg("is_causal"),                    \
           py::arg("window_size_left"),             \
           py::arg("window_size_right"),            \
