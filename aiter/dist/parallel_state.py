@@ -101,39 +101,44 @@ def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)  # type: ignore
 
 
-def all_reduce_fake(
-    tensor: torch.Tensor, group_name: str, ca_fp8_quant: bool
-) -> torch.Tensor:
+def all_reduce_fake(tensor: torch.Tensor, *args, **kwargs) -> torch.Tensor:
     return torch.empty_like(tensor)
 
 
 # There is same name all_reduce in aiter.op, use Alias
 @torch_compile_guard(gen_fake=all_reduce_fake)
 def all_reduce_(
-    tensor: torch.Tensor, group_name: str, ca_fp8_quant: bool
+    tensor: torch.Tensor, group_name: str, ca_use_new: bool, ca_fp8_quant: bool
 ) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
-    return group._all_reduce_out_place(tensor, ca_fp8_quant)
+    return group._all_reduce_out_place(tensor, ca_use_new, ca_fp8_quant)
 
 
 def fused_allreduce_rmsnorm_fake(
-    inp: torch.Tensor, w: torch.Tensor, eps: float, group_name: str
-) -> torch.Tensor:
-    return torch.empty_like(inp)
-
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(res_inp), torch.empty_like(inp)
 
 @torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_fake)
 def fused_allreduce_rmsnorm_(
-    inp: torch.Tensor, w: torch.Tensor, eps: float, group_name: str
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
-    return group._fused_allreduce_rmsnorm_out_place(inp, w, eps)
+    return group._fused_allreduce_rmsnorm_out_place(inp, res_inp, w, eps)
 
 
 if supports_custom_op():
@@ -315,7 +320,7 @@ class GroupCoordinator:
             yield graph_capture_context
 
     def all_reduce(
-        self, input_: torch.Tensor, ca_fp8_quant: bool = False
+        self, input_: torch.Tensor, ca_use_new: bool = False, ca_fp8_quant: bool = False
     ) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
@@ -336,29 +341,42 @@ class GroupCoordinator:
             return input_
 
         return all_reduce_(
-            input_, group_name=self.unique_name, ca_fp8_quant=ca_fp8_quant
+            input_,
+            group_name=self.unique_name,
+            ca_use_new=ca_use_new,
+            ca_fp8_quant=ca_fp8_quant,
         )
 
     def _all_reduce_out_place(
-        self, input_: torch.Tensor, ca_fp8_quant: bool
+        self, input_: torch.Tensor, ca_use_new: bool, ca_fp8_quant: bool
     ) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.all_reduce(input_, ca_fp8_quant)
+        return self.device_communicator.all_reduce(input_, ca_use_new, ca_fp8_quant)
 
     def fused_allreduce_rmsnorm(
-        self, input_: torch.Tensor, weight_: torch.Tensor, eps: float
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return fused_allreduce_rmsnorm_(
-            input_, weight_, eps, group_name=self.unique_name
+            input_, residual_inp_, weight_, eps, group_name=self.unique_name
         )
 
     def _fused_allreduce_rmsnorm_out_place(
-        self, input_: torch.Tensor, weight_: torch.Tensor, eps: float
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.fused_allreduce_rmsnorm(input_, weight_, eps)
+        return self.device_communicator.fused_allreduce_rmsnorm(
+            input_, residual_inp_, weight_, eps
+        )
 
     def _all_gather_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         ca_comm = self.device_communicator.ca_comm
@@ -370,6 +388,11 @@ class GroupCoordinator:
 
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor:
         return outplace_all_gather(input_, group_name=self.unique_name)
+
+    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.reduce_scatter(input_, dim)
 
     def all_gather(
         self, input_: torch.Tensor, use_custom: bool = False, dim: int = -1
@@ -791,6 +814,10 @@ class GroupCoordinator:
             torch.distributed.recv(tensor, self.ranks[src], self.device_group)
         return tensor
 
+    def prepare_communication_buffer_for_model(self, model: torch.nn.Module):
+        if self.device_communicator is not None:
+            self.device_communicator.prepare_communication_buffer_for_model(model)
+
     def destroy(self):
         if hasattr(self, "device_group"):
             torch.distributed.destroy_process_group(self.device_group)
@@ -859,8 +886,6 @@ def get_pp_group() -> GroupCoordinator:
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
 
-
-from typing import Optional
 
 _DP: Optional[GroupCoordinator] = None
 
@@ -1338,3 +1363,21 @@ def _node_count(pg: ProcessGroup) -> int:
                 node_assignment[other_rank] = next_node_id
 
     return next_node_id
+
+
+def prepare_communication_buffer_for_model(model: torch.nn.Module):
+    """Prepare the communication buffer for the model.
+    Traditional communication libraries like NCCL are almost
+    model agnostic. However, emerging new communication libraries like
+    MoE all2all (DeepEP) usually allocate the communication buffer
+    based on the model shape for optimal performance.
+    """
+    logger.debug(f"prepare_communication_buffer_for_model: {_TP} {_PP} {_DP} {_EP}")
+    if _TP is not None:
+        _TP.prepare_communication_buffer_for_model(model)
+    if _PP is not None:
+        _PP.prepare_communication_buffer_for_model(model)
+    if _DP is not None:
+        _DP.prepare_communication_buffer_for_model(model)
+    if _EP is not None:
+        _EP.prepare_communication_buffer_for_model(model)

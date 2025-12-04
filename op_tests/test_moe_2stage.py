@@ -13,6 +13,7 @@ import argparse
 import pandas as pd
 import os
 import numpy as np
+import logging
 
 from aiter.fused_moe import (
     fused_topk,
@@ -49,6 +50,7 @@ def test_fmoe(
     doweight_stage1=False,
     hidden_pad=0,
     intermediate_pad=0,
+    preshuffle=False,
 ):
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
@@ -175,7 +177,7 @@ def test_fmoe(
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
-    elif WQDType != dtypes.fp4x2 or int(os.getenv("AITER_MXFP4_MOE_SF", 0)) == 1:
+    elif WQDType != dtypes.fp4x2 or preshuffle:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
         w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
@@ -257,6 +259,18 @@ def test_fmoe(
         msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
 
+    def calc_diff(x: torch.Tensor, y: torch.Tensor):
+        x, y = x.double(), y.double()
+        denominator = (x * x + y * y).sum()
+        sim = 2 * (x * y).sum() / denominator
+        return 1 - sim
+
+    logits_diff = calc_diff(out2_ref, out2_ck)
+    if logits_diff > 1e-3:
+        logging.warning(
+            f"logits_diff: {logits_diff} is too large, please check the implementation"
+        )
+
     return {"us": us2, "err": err}
 
 
@@ -289,6 +303,7 @@ l_quant = [
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_doweight_stage1 = [False, True][:1]
 l_hidden_intermediate_pad = [(0, 0), (65, 65), (129, 191)][1:2]
+l_preshuffle = [False, True]
 
 
 parser = argparse.ArgumentParser(
@@ -382,6 +397,18 @@ parser.add_argument(
     e.g.: -k 2""",
 )
 
+parser.add_argument(
+    "-p",
+    "--preshuffle",
+    type=dtypes.str2bool,
+    nargs="?",
+    const=None,
+    default=None,
+    help="""Whether to use pre-shuffle weight mode. Default is [False, True].
+    -p f    # False.
+    -p t    # True.""",
+)
+
 args = parser.parse_args()
 if args.dtype is None:
     l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
@@ -401,6 +428,9 @@ if args.act is not None:
 
 if args.doweight_stage1 is not None:
     l_doweight_stage1 = [args.doweight_stage1]
+
+if args.preshuffle is not None:
+    l_preshuffle = [args.preshuffle]
 
 df = []
 for (
@@ -433,6 +463,30 @@ for (
                     intermediate_pad=intermediate_pad,
                 )
                 df.append(ret)
+    elif (quant_type, aq_dtype, wq_dtype) == (
+        aiter.QuantType.per_1x32,
+        dtypes.fp4x2,
+        dtypes.fp4x2,
+    ):
+        for preshuffle in l_preshuffle:
+            for act_type in l_act:
+                for m in l_tokenNum:
+                    ret = test_fmoe(
+                        dtype,
+                        m,
+                        model_dim,
+                        inter_dim,
+                        args.expert,
+                        args.topk,
+                        act_type,
+                        quant_type,
+                        aq_dtype,
+                        wq_dtype,
+                        use_g1u1=True,
+                        doweight_stage1=doweight_stage1,
+                        preshuffle=preshuffle,
+                    )
+                    df.append(ret)
     else:
         for act_type in l_act:
             for m in l_tokenNum:
