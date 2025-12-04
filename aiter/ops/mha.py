@@ -1253,6 +1253,7 @@ def _flash_attn_forward(
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16)
         ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
+        ret = ret and logits_soft_cap == 0.0
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
