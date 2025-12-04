@@ -86,7 +86,7 @@ std::vector<at::Tensor> fmha_v3_fwd_ck(const at::Tensor& q, // [b, sq, hq, d]
                            bias_enum::no_bias,
                            false,
                            false,
-                           false};
+                           quant_scale_enum::no_scale};
 
     fmha_fwd_args args;
 
