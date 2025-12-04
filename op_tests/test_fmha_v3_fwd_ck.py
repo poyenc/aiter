@@ -30,6 +30,7 @@ def run_torch(
     k,
     v,
     causal,
+    logits_soft_cap: float = 0.0,
     upcast=True,
     reorder_ops=False,
 ):
@@ -38,6 +39,7 @@ def run_torch(
         k,
         v,
         causal=causal,
+        softcap=logits_soft_cap,
         upcast=upcast,
         reorder_ops=reorder_ops,
     )
@@ -84,6 +86,7 @@ def efficiency(flop, time_in_us):
     ],
 )
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 10.0])
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("seed", [None])
@@ -95,6 +98,7 @@ def test_fmha_v3_fwd_ck(
     d,
     d_v,
     causal,
+    logits_soft_cap,
     mha_type,
     dtype,
     seed,
@@ -157,11 +161,13 @@ def test_fmha_v3_fwd_ck(
     # attention = aiter.flash_attn_func
     attention = aiter.fmha_v3_fwd_ck_func
     if profile:
-        out, time = profile_func(attention, q, k, v, causal=causal)
+        out, time = profile_func(
+            attention, q, k, v, causal=causal, logits_soft_cap=logits_soft_cap
+        )
         tflops = efficiency(flops(batch_size, seqlen_q, d, nheads, causal), time)
         print(f"time: {time:.2f} us, {tflops:.2f} TFlops")
     else:
-        out = attention(q, k, v, causal=causal)
+        out = attention(q, k, v, causal=causal, logits_soft_cap=logits_soft_cap)
 
     # print_tensor(out.squeeze(0).squeeze(1), 'O')
 
@@ -171,7 +177,7 @@ def test_fmha_v3_fwd_ck(
     _strict = True
 
     if _strict:
-        out_ref = run_torch(q, k, v, causal=causal)
+        out_ref = run_torch(q, k, v, causal=causal, logits_soft_cap=logits_soft_cap)
 
         # print_tensor(out_ref.squeeze(0).squeeze(1), 'out_ref')
 
@@ -180,6 +186,7 @@ def test_fmha_v3_fwd_ck(
             k,
             v,
             causal=causal,
+            logits_soft_cap=logits_soft_cap,
             upcast=False,
             reorder_ops=True,
         )
@@ -213,6 +220,7 @@ if __name__ == "__main__":
         causal: MaskType
 
     profile = True
+    logits_sof_cap = 0.0
     seed = 0
 
     problem_sizes = [
@@ -268,6 +276,7 @@ if __name__ == "__main__":
                 d,
                 d_v,
                 causal,
+                logits_sof_cap,
                 mha_type,
                 dtype,
                 seed,
