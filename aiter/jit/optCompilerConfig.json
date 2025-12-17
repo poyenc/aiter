@@ -786,6 +786,8 @@
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
             "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
+            "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'",
+            "f'-DCK_TILE_ATTENTION_USE_SOFTSIGN_ASM={os.environ.get(\"CK_TILE_ATTENTION_USE_SOFTSIGN_ASM\", 0)}'",
             "'-mllvm --amdgpu-disable-packed-fp32=1'",
             "'-mllvm --greedy-reverse-local-assignment'"
         ],
@@ -811,6 +813,7 @@
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
             "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
             "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'",
+            "f'-DCK_TILE_ATTENTION_USE_SOFTSIGN_ASM={os.environ.get(\"CK_TILE_ATTENTION_USE_SOFTSIGN_ASM\", 0)}'",
             "'-mllvm --amdgpu-disable-packed-fp32=1'",
             "'-mllvm --greedy-reverse-local-assignment'"
         ],
@@ -1114,6 +1117,8 @@
             "'-DNDEBUG'",
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
             "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
+            "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'",
+            "f'-DCK_TILE_ATTENTION_USE_SOFTSIGN_ASM={os.environ.get(\"CK_TILE_ATTENTION_USE_SOFTSIGN_ASM\", 0)}'",
             "'--save-temps'",
             "'-mllvm --amdgpu-disable-packed-fp32=1'",
             "'-mllvm --greedy-reverse-local-assignment'"
@@ -1123,7 +1128,7 @@
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
         "verbose": "False",
-        "hip_clang_path": "os.environ.get('MHA_HIP_CLANG_PATH')",
+        "hip_clang_path": "os.environ.get('CK_MHA_HIP_CLANG_PATH')",
         "blob_gen_cmd": []
     },
     "module_fmha_v3_varlen_fwd_ck": {
@@ -1153,6 +1158,8 @@
             "'-DNDEBUG'",
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
             "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
+            "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'",
+            "f'-DCK_TILE_ATTENTION_USE_SOFTSIGN_ASM={os.environ.get(\"CK_TILE_ATTENTION_USE_SOFTSIGN_ASM\", 0)}'",
             "'--save-temps'",
             "'-mllvm --amdgpu-disable-packed-fp32=1'",
             "'-mllvm --greedy-reverse-local-assignment'"
@@ -1162,7 +1169,7 @@
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
         "verbose": "False",
-        "hip_clang_path": "os.environ.get('MHA_HIP_CLANG_PATH')",
+        "hip_clang_path": "os.environ.get('CK_MHA_HIP_CLANG_PATH')",
         "blob_gen_cmd": []
     }
 }
