@@ -217,6 +217,7 @@ def test_fmha_v3_fwd_ck(
     ],
 )
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 10.0])
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("seed", [None])
