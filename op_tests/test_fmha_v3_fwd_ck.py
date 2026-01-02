@@ -186,7 +186,9 @@ def test_fmha_v3_fwd_ck(
             out_pt - out_ref
         ).abs().max().item()
     else:
-        out_ref, _ = flash_attn_func(q, k, v, causal=causal, return_lse=True)
+        out_ref, _ = flash_attn_func(
+            q, k, v, causal=causal, logits_soft_cap=logits_soft_cap, return_lse=True
+        )
         print(f"Output max diff: {(out - out_ref).abs().max().item()}")
         torch.testing.assert_close(out, out_ref, rtol=1e-3, atol=1e-2)
 
@@ -487,6 +489,8 @@ if __name__ == "__main__":
         mha_type = "mha" if nheads == nheads_k else "mqa"
 
         for causal in l_causal:
+            # Override logits soft-capping for certain model config
+            logits_soft_cap = logits_soft_cap if seqlen_q != 37200 else 0.0
             print(
                 f"b:{batch_size}, h:{nheads}/{nheads_k}, s={seqlen_q}/{seqlen_k}, causal={causal}, logits={logits_soft_cap}, dtype={dtype}"
             )
@@ -500,7 +504,7 @@ if __name__ == "__main__":
                     d,
                     d_v,
                     causal,
-                    logits_soft_cap if seqlen_q != 37200 else 0.0,
+                    logits_soft_cap,
                     mha_type,
                     dtype,
                     seed,
@@ -515,7 +519,7 @@ if __name__ == "__main__":
                     d,
                     d_v,
                     causal,
-                    logits_soft_cap if seqlen_q != 37200 else 0.0,
+                    logits_soft_cap,
                     mha_type,
                     dtype,
                     seed,
