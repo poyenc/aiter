@@ -436,7 +436,9 @@ def attention_ref(
     else:
         scores = torch.einsum("bthd,bshd->bhts", q, k / math.sqrt(d))
     if softcap > 0:
-        use_softsign = os.environ.get("CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT", 0)
+        use_softsign = int(
+            os.environ.get("CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT", 0)
+        )
         if use_softsign:
             scores = scores / (1.0 + torch.abs(scores / softcap))
         else:
