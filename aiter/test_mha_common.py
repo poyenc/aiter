@@ -7,6 +7,7 @@ from einops import rearrange, repeat
 import torch
 import torch.nn.functional as F
 from aiter import dtypes
+import os
 
 
 def ck_randval_to_dropout_mask(randval, p):
@@ -435,9 +436,14 @@ def attention_ref(
     else:
         scores = torch.einsum("bthd,bshd->bhts", q, k / math.sqrt(d))
     if softcap > 0:
-        scores = scores / softcap
-        scores = scores.tanh()
-        scores = scores * softcap
+        use_softsign = os.environ.get("CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT", 0)
+        if use_softsign:
+            scores = scores / (1.0 + torch.abs(scores / softcap))
+        else:
+            scores = scores / softcap
+            scores = scores.tanh()
+            scores = scores * softcap
+
     if key_padding_mask is not None:
         scores.masked_fill_(
             rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf")
