@@ -432,7 +432,7 @@ if __name__ == "__main__":
         causal: MaskType
 
     profile = False
-    logits_sof_cap = 30.0
+    logits_soft_cap = 30.0
     seed = 0
 
     problem_sizes = [
@@ -488,7 +488,7 @@ if __name__ == "__main__":
 
         for causal in l_causal:
             print(
-                f"b:{batch_size}, h:{nheads}/{nheads_k}, s={seqlen_q}/{seqlen_k}, causal={causal}, dtype={dtype}"
+                f"b:{batch_size}, h:{nheads}/{nheads_k}, s={seqlen_q}/{seqlen_k}, causal={causal}, logits={logits_soft_cap}, dtype={dtype}"
             )
 
             if args.mode == "regular":
@@ -500,7 +500,7 @@ if __name__ == "__main__":
                     d,
                     d_v,
                     causal,
-                    logits_sof_cap if seqlen_q != 37200 else 0.0,
+                    logits_soft_cap if seqlen_q != 37200 else 0.0,
                     mha_type,
                     dtype,
                     seed,
@@ -515,7 +515,7 @@ if __name__ == "__main__":
                     d,
                     d_v,
                     causal,
-                    logits_sof_cap if seqlen_q != 37200 else 0.0,
+                    logits_soft_cap if seqlen_q != 37200 else 0.0,
                     mha_type,
                     dtype,
                     seed,
