@@ -15,36 +15,23 @@ from aiter.test_mha_common import (
 import itertools
 import pytest
 import sys
+import argparse
 from dataclasses import dataclass
 from typing import Tuple
 from enum import Enum
 
+REF_BY_TORCH = False
 REF_BY_TRITON = False
 
-if REF_BY_TRITON:
-    from aiter.ops.triton.mha_v3 import flash_attn_func, flash_attn_varlen_func
-else:
-    from aiter import flash_attn_func, flash_attn_varlen_func
+if not REF_BY_TORCH:
+    if REF_BY_TRITON:
+        from aiter.ops.triton.mha_v3 import flash_attn_func, flash_attn_varlen_func
+    else:
+        from aiter import flash_attn_func, flash_attn_varlen_func
 
 
-def run_torch(
-    q,
-    k,
-    v,
-    causal,
-    logits_soft_cap: float = 0.0,
-    upcast=True,
-    reorder_ops=False,
-):
-    out, _, _ = attention_ref(
-        q,
-        k,
-        v,
-        causal=causal,
-        softcap=logits_soft_cap,
-        upcast=upcast,
-        reorder_ops=reorder_ops,
-    )
+def run_torch(q, k, v, *args, **kwargs):
+    out, _, _ = attention_ref(q, k, v, *args, **kwargs)
 
     return out
 
@@ -176,10 +163,8 @@ def test_fmha_v3_fwd_ck(
     if profile:
         return
 
-    _strict = True
-
-    if _strict:
-        out_ref = run_torch(q, k, v, causal=causal, logits_soft_cap=logits_soft_cap)
+    if REF_BY_TORCH:
+        out_ref = run_torch(q, k, v, causal=causal, softcap=logits_soft_cap)
 
         # print_tensor(out_ref.squeeze(0).squeeze(1), 'out_ref')
 
@@ -188,7 +173,7 @@ def test_fmha_v3_fwd_ck(
             k,
             v,
             causal=causal,
-            logits_soft_cap=logits_soft_cap,
+            softcap=logits_soft_cap,
             upcast=False,
             reorder_ops=True,
         )
@@ -204,8 +189,6 @@ def test_fmha_v3_fwd_ck(
         out_ref, _ = flash_attn_func(q, k, v, causal=causal, return_lse=True)
         print(f"Output max diff: {(out - out_ref).abs().max().item()}")
         torch.testing.assert_close(out, out_ref, rtol=1e-3, atol=1e-2)
-
-
 
 
 @pytest.mark.parametrize("batch_size", [5])
@@ -266,17 +249,47 @@ def test_fmha_v3_varlen_fwd_ck(
             print("[HOST] {0}[{1:3}] = {2}".format(tensor_name, i, formatted_row))
         sys.stdout.flush()
 
-    q = torch.randn(batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype, requires_grad=False)
-    k = torch.randn(batch_size, seqlen_k, nheads_k, d, device="cuda", dtype=dtype, requires_grad=False)
-    v = torch.randn(batch_size, seqlen_k, nheads_k, d_v, device="cuda", dtype=dtype, requires_grad=False)
-    query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, "cuda", mode="random")
-    key_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, "cuda", mode="random")
+    q = torch.randn(
+        batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype, requires_grad=False
+    )
+    k = torch.randn(
+        batch_size,
+        seqlen_k,
+        nheads_k,
+        d,
+        device="cuda",
+        dtype=dtype,
+        requires_grad=False,
+    )
+    v = torch.randn(
+        batch_size,
+        seqlen_k,
+        nheads_k,
+        d_v,
+        device="cuda",
+        dtype=dtype,
+        requires_grad=False,
+    )
+    query_padding_mask = generate_random_padding_mask(
+        seqlen_q, batch_size, "cuda", mode="random"
+    )
+    key_padding_mask = generate_random_padding_mask(
+        seqlen_k, batch_size, "cuda", mode="random"
+    )
     (
-        q_unpad, k_unpad, v_unpad,
-        cu_seqlens_q, cu_seqlens_k,
-        max_seqlen_q, max_seqlen_k,
-        q, k, v,
-        output_pad_fn, dq_pad_fn, dk_pad_fn,
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        q,
+        k,
+        v,
+        output_pad_fn,
+        dq_pad_fn,
+        dk_pad_fn,
     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
 
     # print(f'{q_unpad.shape=}')
@@ -298,46 +311,64 @@ def test_fmha_v3_varlen_fwd_ck(
     attention = aiter.fmha_v3_varlen_fwd_ck_func
     if profile:
         out, time = profile_func(
-                attention,
-                q_unpad, k_unpad, v_unpad,
-                cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k,
-                causal=causal,
-                logits_soft_cap=logits_soft_cap)
+            attention,
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+        )
         tflops = efficiency(flops(batch_size, seqlen_q, d, nheads, causal), time)
         print(f"time: {time:.2f} us, {tflops:.2f} TFlops")
     else:
         out = attention(
-                q_unpad, k_unpad, v_unpad,
-                cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k,
-                causal=causal,
-                logits_soft_cap=logits_soft_cap)
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+        )
 
     # print_tensor(out.squeeze(0).squeeze(1), 'O')
 
     if profile:
         return
 
-    _strict = False
-
-    if _strict:
-        out_ref = run_torch(q, k, v, causal=causal, logits_soft_cap=logits_soft_cap)
+    if REF_BY_TORCH:
+        out_ref = run_torch(
+            q,
+            k,
+            v,
+            query_padding_mask=query_padding_mask,
+            key_padding_mask=key_padding_mask,
+            causal=causal,
+            softcap=logits_soft_cap,
+        )
 
         # print_tensor(out_ref.squeeze(0).squeeze(1), 'out_ref')
 
         out_pt = run_torch(
-            q, k, v,
-            cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q, max_seqlen_k,
+            q,
+            k,
+            v,
+            query_padding_mask=query_padding_mask,
+            key_padding_mask=key_padding_mask,
             causal=causal,
-            logits_soft_cap=logits_soft_cap,
+            softcap=logits_soft_cap,
             upcast=False,
             reorder_ops=True,
         )
 
         # print_tensor(out_pt.squeeze(0).squeeze(1), 'out_pt')
-
+        out = output_pad_fn(out)
         print(f"Output max diff: {(out - out_ref).abs().max().item()}")
         print(f"Output Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
         assert (out - out_ref).abs().max().item() <= 2 * (
@@ -347,27 +378,45 @@ def test_fmha_v3_varlen_fwd_ck(
 
         if REF_BY_TRITON:
             out_ref, _ = flash_attn_varlen_func(
-                    q_unpad, k_unpad, v_unpad,
-                    cu_seqlens_q, cu_seqlens_k,
-                    max_seqlen_q, max_seqlen_k,
-                    causal=causal,
-                    softcap=logits_soft_cap)
+                q_unpad,
+                k_unpad,
+                v_unpad,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                causal=causal,
+                softcap=logits_soft_cap,
+            )
         else:
             out_ref, _ = flash_attn_varlen_func(
-                    q_unpad, k_unpad, v_unpad,
-                    cu_seqlens_q, cu_seqlens_k,
-                    max_seqlen_q, max_seqlen_k,
-                    causal=causal, return_lse=True,
-                    logits_soft_cap=logits_soft_cap)
+                q_unpad,
+                k_unpad,
+                v_unpad,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                causal=causal,
+                return_lse=True,
+                logits_soft_cap=logits_soft_cap,
+            )
         out = output_pad_fn(out)
         out_ref = output_pad_fn(out_ref)
-        print(f'out {out.shape}')
-        print(f'out_ref {out_ref.shape}')
         print(f"Output max diff: {(out - out_ref).abs().max().item()}")
         torch.testing.assert_close(out, out_ref, rtol=1e-3, atol=1e-2)
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Test FMHA v3 forward kernels")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["regular", "varlen"],
+        default="varlen",
+        help="Test mode: 'regular' for standard format, 'varlen' for variable length format",
+    )
+    args = parser.parse_args()
 
     class MaskType(Enum):
         CAUSAL = 1
@@ -388,16 +437,15 @@ if __name__ == "__main__":
 
     problem_sizes = [
         # batch_size, (nheads, nheads_k), (seqlen_q, seqlen_k), (d, d_v), causal mask
-#        ProblemSize(32, (16,), (512,), (128,), MaskType.BOTH),
-#        ProblemSize(16, (16,), (1024,), (128,), MaskType.BOTH),
-#        ProblemSize(8, (16,), (2048,), (128,), MaskType.BOTH),
-#        ProblemSize(4, (16,), (4096,), (128,), MaskType.BOTH),
-#        ProblemSize(2, (16,), (8192,), (128,), MaskType.BOTH),
-#        ProblemSize(1, (16,), (16384,), (128,), MaskType.BOTH),
-#        ProblemSize(1, (64,), (16384,), (128,), MaskType.BOTH),
-#        ProblemSize(1, (16, 1), (65536,), (128,), MaskType.BOTH),
-#        ProblemSize(1, (40,), (37200,), (128,), MaskType.BOTH),
-
+        #        ProblemSize(32, (16,), (512,), (128,), MaskType.BOTH),
+        #        ProblemSize(16, (16,), (1024,), (128,), MaskType.BOTH),
+        #        ProblemSize(8, (16,), (2048,), (128,), MaskType.BOTH),
+        #        ProblemSize(4, (16,), (4096,), (128,), MaskType.BOTH),
+        #        ProblemSize(2, (16,), (8192,), (128,), MaskType.BOTH),
+        #        ProblemSize(1, (16,), (16384,), (128,), MaskType.BOTH),
+        #        ProblemSize(1, (64,), (16384,), (128,), MaskType.BOTH),
+        #        ProblemSize(1, (16, 1), (65536,), (128,), MaskType.BOTH),
+        #        ProblemSize(1, (40,), (37200,), (128,), MaskType.BOTH),
         ProblemSize(1, (6, 1), (1024,), (128,), MaskType.CAUSAL),
         ProblemSize(1, (6, 1), (2048,), (128,), MaskType.CAUSAL),
         ProblemSize(1, (6, 1), (4096,), (128,), MaskType.CAUSAL),
@@ -442,33 +490,34 @@ if __name__ == "__main__":
             print(
                 f"b:{batch_size}, h:{nheads}/{nheads_k}, s={seqlen_q}/{seqlen_k}, causal={causal}, dtype={dtype}"
             )
-            '''
-            test_fmha_v3_fwd_ck(
-                batch_size,
-                nheads,
-                seqlen_q,
-                seqlen_k,
-                d,
-                d_v,
-                causal,
-                logits_sof_cap if seqlen_q != 37200 else 0.0,
-                mha_type,
-                dtype,
-                seed,
-                profile=profile,
-            )
-            '''
-            test_fmha_v3_varlen_fwd_ck(
-                batch_size,
-                nheads,
-                seqlen_q,
-                seqlen_k,
-                d,
-                d_v,
-                causal,
-                logits_sof_cap if seqlen_q != 37200 else 0.0,
-                mha_type,
-                dtype,
-                seed,
-                profile=profile,
-            )
+
+            if args.mode == "regular":
+                test_fmha_v3_fwd_ck(
+                    batch_size,
+                    nheads,
+                    seqlen_q,
+                    seqlen_k,
+                    d,
+                    d_v,
+                    causal,
+                    logits_sof_cap if seqlen_q != 37200 else 0.0,
+                    mha_type,
+                    dtype,
+                    seed,
+                    profile=profile,
+                )
+            elif args.mode == "varlen":
+                test_fmha_v3_varlen_fwd_ck(
+                    batch_size,
+                    nheads,
+                    seqlen_q,
+                    seqlen_k,
+                    d,
+                    d_v,
+                    causal,
+                    logits_sof_cap if seqlen_q != 37200 else 0.0,
+                    mha_type,
+                    dtype,
+                    seed,
+                    profile=profile,
+                )
