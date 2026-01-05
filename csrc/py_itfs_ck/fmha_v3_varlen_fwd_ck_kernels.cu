@@ -22,14 +22,35 @@ std::vector<at::Tensor> fmha_v3_varlen_fwd_ck(const at::Tensor& q,            //
                                               int max_seqlen_k,
                                               float softmax_scale,
                                               float logits_soft_cap,
-                                              bool is_causal)
+                                              bool is_causal,
+                                              std::optional<const at::Tensor> q_descale, // [1]
+                                              std::optional<const at::Tensor> k_descale, // [1]
+                                              std::optional<const at::Tensor> v_descale  // [1]
+)
 {
-    auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == at::ScalarType::Half || q_dtype == at::ScalarType::BFloat16,
-                "FlashAttention only support fp16 and bf16 data type");
+    auto q_dtype = q.scalar_type();
+    bool is_qkv_fp8 =
+        q_dtype == at::ScalarType::Float8_e4m3fn || q_dtype == at::ScalarType::Float8_e4m3fnuz;
+
+    TORCH_CHECK(q_dtype == at::ScalarType::Half || q_dtype == at::ScalarType::BFloat16 ||
+                    is_qkv_fp8,
+                "FlashAttention only support fp16, bf16 and fp8_e4m3 data type");
 
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+
+    std::string dtype_str = torchDTypeToStr(c10::scalarTypeToTypeMeta(q_dtype));
+    if(is_qkv_fp8)
+    {
+        dtype_str = "fp8bf16"; // only support bf16 out for fp8
+    }
+
+    quant_scale_enum qscale_type =
+        q_descale.has_value() ? quant_scale_enum::pertensor : quant_scale_enum::no_scale;
+
+    TORCH_CHECK(q_descale.has_value() == k_descale.has_value() &&
+                    k_descale.has_value() == v_descale.has_value(),
+                "q_descale, k_descale, v_descale must be all provided or all not provided");
 
     CHECK_DEVICE(q);
     CHECK_DEVICE(k);
@@ -75,15 +96,9 @@ std::vector<at::Tensor> fmha_v3_varlen_fwd_ck(const at::Tensor& q,            //
         mask = mask_info::decode("0", max_seqlen_q, max_seqlen_k); // no mask
     }
 
-    std::string q_dtype_str;
-    if(q_dtype == at::ScalarType::Half)
-        q_dtype_str = "fp16";
-    else if(q_dtype == at::ScalarType::BFloat16)
-        q_dtype_str = "bf16";
-
     fmha_fwd_traits traits{head_size_q,
                            head_size_q,
-                           q_dtype_str,
+                           dtype_str,
                            true,
                            true,
                            0.f < logits_soft_cap,
@@ -91,7 +106,7 @@ std::vector<at::Tensor> fmha_v3_varlen_fwd_ck(const at::Tensor& q,            //
                            bias_enum::no_bias,
                            false,
                            false,
-                           quant_scale_enum::no_scale};
+                           qscale_type};
 
     fmha_fwd_args args;
 
@@ -128,8 +143,13 @@ std::vector<at::Tensor> fmha_v3_varlen_fwd_ck(const at::Tensor& q,            //
     args.stride_v       = v.stride(0);
     args.nhead_stride_v = v.stride(1);
 
+    args.q_descale_ptr = q_descale.has_value() ? q_descale.value().data_ptr() : nullptr;
+    args.k_descale_ptr = k_descale.has_value() ? k_descale.value().data_ptr() : nullptr;
+    args.v_descale_ptr = v_descale.has_value() ? v_descale.value().data_ptr() : nullptr;
+
     auto opts           = q.options();
-    at::Tensor out      = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(q_dtype));
+    auto out_type       = dtype_str == "fp8bf16" ? at::ScalarType::BFloat16 : q_dtype;
+    at::Tensor out      = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(out_type));
     args.o_ptr          = out.data_ptr();
     args.stride_o       = out.stride(0);
     args.nhead_stride_o = out.stride(1);

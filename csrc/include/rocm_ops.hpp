@@ -1661,15 +1661,18 @@ namespace py = pybind11;
           py::arg("stride0")   = -1,              \
           py::arg("stride1")   = 1);
 
-#define MHA_V3_FWD_CK_PYBIND                  \
-    m.def("fmha_v3_fwd_ck",                   \
-          &aiter::torch_itfs::fmha_v3_fwd_ck, \
-          py::arg("q"),                       \
-          py::arg("k"),                       \
-          py::arg("v"),                       \
-          py::arg("softmax_scale"),           \
-          py::arg("logits_soft_cap"),         \
-          py::arg("is_causal"));
+#define MHA_V3_FWD_CK_PYBIND                   \
+    m.def("fmha_v3_fwd_ck",                    \
+          &aiter::torch_itfs::fmha_v3_fwd_ck,  \
+          py::arg("q"),                        \
+          py::arg("k"),                        \
+          py::arg("v"),                        \
+          py::arg("softmax_scale"),            \
+          py::arg("logits_soft_cap"),          \
+          py::arg("is_causal"),                \
+          py::arg("q_descale") = std::nullopt, \
+          py::arg("k_descale") = std::nullopt, \
+          py::arg("v_descale") = std::nullopt);
 
 #define MHA_V3_VARLEN_FWD_CK_PYBIND                  \
     m.def("fmha_v3_varlen_fwd_ck",                   \
@@ -1683,4 +1686,7 @@ namespace py = pybind11;
           py::arg("max_seqlen_k"),                   \
           py::arg("softmax_scale"),                  \
           py::arg("logits_soft_cap"),                \
-          py::arg("is_causal"));
+          py::arg("is_causal"),                      \
+          py::arg("q_descale") = std::nullopt,       \
+          py::arg("k_descale") = std::nullopt,       \
+          py::arg("v_descale") = std::nullopt);

@@ -2916,6 +2916,9 @@ def fmha_v3_fwd_ck(
     softmax_scale: float,
     logits_soft_cap: float,
     is_causal: bool,
+    q_descale: Optional[Tensor],
+    k_descale: Optional[Tensor],
+    v_descale: Optional[Tensor],
 ) -> List[Tensor]: ...
 
 
@@ -2931,6 +2934,9 @@ def fmha_v3_varlen_fwd_ck(
     softmax_scale: float,
     logits_soft_cap: float,
     is_causal: bool,
+    q_descale: Optional[Tensor],
+    k_descale: Optional[Tensor],
+    v_descale: Optional[Tensor],
 ) -> List[Tensor]: ...
 
 
@@ -2941,6 +2947,9 @@ def fmha_v3_fwd_ck_func(
     softmax_scale: float = None,
     logits_soft_cap: float = 0.0,
     causal: bool = False,
+    q_descale: Optional[Tensor] = None,
+    k_descale: Optional[Tensor] = None,
+    v_descale: Optional[Tensor] = None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -2960,6 +2969,9 @@ def fmha_v3_fwd_ck_func(
         softmax_scale,
         logits_soft_cap=logits_soft_cap,
         is_causal=causal,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
     )[0]
     out = out_padded[..., :head_size_v_og]
 
@@ -2979,6 +2991,9 @@ def fmha_v3_varlen_fwd_ck_func(
     softmax_scale: float = None,
     logits_soft_cap: float = 0.0,
     causal: bool = False,
+    q_descale: Optional[Tensor] = None,
+    k_descale: Optional[Tensor] = None,
+    v_descale: Optional[Tensor] = None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -3002,6 +3017,9 @@ def fmha_v3_varlen_fwd_ck_func(
         softmax_scale,
         logits_soft_cap=logits_soft_cap,
         is_causal=causal,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
     )[0]
     out = out_padded[..., :head_size_v_og]
 
