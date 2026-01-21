@@ -49,14 +49,14 @@ def cmdGenFunc_mha_fwd(
     filter = "*"
     if q.dtype == dtypes.fp16:
         md_name += "_fp16"
-        filter += "fp16*"
+        filter += "_fp16*"
     elif q.dtype == dtypes.bf16:
         md_name += "_bf16"
-        filter += "bf16*"
+        filter += "_bf16*"
     elif q.dtype == dtypes.fp8:
         if out is None or out.dtype == dtypes.bf16:
             md_name += "_fp8bf16"
-            filter += "fp8bf16*"
+            filter += "_fp8bf16*"
         else:
             raise NotImplementedError("Unsupported output dtype for FP8 MHA")
     if bias is not None:
