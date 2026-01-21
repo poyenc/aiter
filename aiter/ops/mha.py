@@ -73,7 +73,7 @@ def cmdGenFunc_mha_fwd(
         filter += "_nmask*"
     else:
         md_name += "_mask"
-        filter += "_mask*"
+        filter += "_m*"
     if return_softmax_lse:
         md_name += "_lse"
         filter += "_lse*"
