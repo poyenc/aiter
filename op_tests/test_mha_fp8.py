@@ -71,12 +71,21 @@ def attention_fp8_ref(
     scale_s = (1.0 / math.sqrt(d)) * q_descale * k_descale
     scores = torch.einsum("bthd,bshd->bhts", q, k) * scale_s
 
-    # Apply causal mask
-    if window_size[1] == 0:
-        mask = torch.triu(
-            torch.ones(seqlen_q, seqlen_k, device=q_fp8.device, dtype=torch.bool),
-            diagonal=1,
+    # Apply causal/local mask (aligned with attention_ref implementation)
+    if window_size[0] >= 0 or window_size[1] >= 0:
+        row_idx = torch.arange(seqlen_q, device=q_fp8.device, dtype=torch.long).view(
+            -1, 1
         )
+        col_idx = torch.arange(seqlen_k, device=q_fp8.device, dtype=torch.long)
+        if window_size[0] < 0:
+            # Causal only (no left window limit)
+            mask = col_idx > row_idx + seqlen_k - seqlen_q + window_size[1]
+        else:
+            # Sliding window attention
+            mask = torch.logical_or(
+                col_idx > row_idx + seqlen_k - seqlen_q + window_size[1],
+                col_idx < row_idx + seqlen_k - seqlen_q - window_size[0],
+            )
         scores.masked_fill_(mask, float("-inf"))
 
     # Step 2: Softmax (fp32 -> fp32)
