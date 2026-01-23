@@ -28,9 +28,11 @@ def attention_fp8_ref(
     """
     Reference implementation for FP8 FMHA kernel computation.
 
-    Simulates the FP8 flash attention kernel computation flow:
-    1. QK^T GEMM: fp8 x fp8 -> fp32, scaled by (1/sqrt(d)) * q_descale * k_descale
-    2. Softmax: fp32 -> fp32
+    Simulates the FP8 flash attention kernel computation flow with FAST_EXP2 path:
+    1. QK^T GEMM: fp8 x fp8 -> fp32 (no scaling yet)
+    2. Online softmax using exp2: scale_s includes log2(e) factor
+       - scale_s = (1/sqrt(d)) * log2(e) * q_descale * k_descale
+       - p = exp2(scale_s * (scores - row_max))
     3. P quantization: P_fp8 = (P_fp32 * scale_p).to(fp8), where scale_p = fp8_max
     4. PV GEMM: fp8 x fp8 -> fp32
     5. Output conversion: O_bf16 = (O_fp32 * scale_o).to(bf16), where scale_o = v_descale / scale_p
@@ -57,6 +59,9 @@ def attention_fp8_ref(
     # FP8 E4M3 max value
     fp8_max = torch.finfo(dtypes.fp8).max  # 448.0
 
+    # log2(e) for FAST_EXP2 path
+    log2e = math.log2(math.e)  # 1.4426950408889634
+
     # Dequantize fp8 inputs to fp32 for GEMM simulation
     q = q_fp8.float()
     k = k_fp8.float()
@@ -67,9 +72,8 @@ def attention_fp8_ref(
     v = repeat(v, "b s h d -> b s (h g) d", g=q_fp8.shape[2] // v_fp8.shape[2])
 
     # Step 1: QK^T GEMM (fp8 x fp8 -> fp32)
-    # Combined scale: scale_s = (1/sqrt(d)) * q_descale * k_descale
-    scale_s = (1.0 / math.sqrt(d)) * q_descale * k_descale
-    scores = torch.einsum("bthd,bshd->bhts", q, k) * scale_s
+    # In FAST_EXP2 path, scores are NOT scaled here
+    scores = torch.einsum("bthd,bshd->bhts", q, k)
 
     # Apply causal/local mask (aligned with attention_ref implementation)
     if window_size[0] >= 0 or window_size[1] >= 0:
@@ -88,8 +92,15 @@ def attention_fp8_ref(
             )
         scores.masked_fill_(mask, float("-inf"))
 
-    # Step 2: Softmax (fp32 -> fp32)
-    p = torch.softmax(scores, dim=-1)
+    # Step 2: Softmax using exp2 (FAST_EXP2 path)
+    # scale_s = (1/sqrt(d)) * log2(e) * q_descale * k_descale
+    scale_s = (1.0 / math.sqrt(d)) * log2e * q_descale * k_descale
+
+    # Online softmax: p = exp2(scale_s * scores - scale_s * row_max)
+    # This is mathematically equivalent to: exp((1/sqrt(d)) * q_descale * k_descale * (scores - row_max))
+    row_max = scores.max(dim=-1, keepdim=True).values
+    p = torch.exp2(scale_s * scores - scale_s * row_max)
+    p = p / p.sum(dim=-1, keepdim=True)
 
     # Step 3: P quantization (fp32 -> fp8)
     # scale_p = fp8_max, P_fp8 = (P * scale_p).to(fp8)
