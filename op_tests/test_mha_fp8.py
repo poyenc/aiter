@@ -1,16 +1,103 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import math
 import torch
 import aiter
 from aiter import dtypes
 from aiter.test_common import run_perftest
 from aiter import per_tensor_quant
+from einops import repeat
 import pytest
 import pandas as pd
 import argparse
 
 benchmark = {}
+
+
+def attention_fp8_ref(
+    q_fp8,
+    k_fp8,
+    v_fp8,
+    q_descale: float,
+    k_descale: float,
+    v_descale: float,
+    causal=False,
+    window_size=(-1, -1),
+):
+    """
+    Reference implementation for FP8 FMHA kernel computation.
+
+    Simulates the FP8 flash attention kernel computation flow:
+    1. QK^T GEMM: fp8 x fp8 -> fp32, scaled by (1/sqrt(d)) * q_descale * k_descale
+    2. Softmax: fp32 -> fp32
+    3. P quantization: P_fp8 = (P_fp32 * scale_p).to(fp8), where scale_p = fp8_max
+    4. PV GEMM: fp8 x fp8 -> fp32
+    5. Output conversion: O_bf16 = (O_fp32 * scale_o).to(bf16), where scale_o = v_descale / scale_p
+
+    Arguments:
+        q_fp8: (batch_size, seqlen_q, nheads, head_dim) - fp8 quantized query
+        k_fp8: (batch_size, seqlen_k, nheads_k, head_dim) - fp8 quantized key
+        v_fp8: (batch_size, seqlen_k, nheads_k, head_dim_v) - fp8 quantized value
+        q_descale: scale factor for dequantizing q
+        k_descale: scale factor for dequantizing k
+        v_descale: scale factor for dequantizing v
+        causal: whether to apply causal masking
+        window_size: (int, int), left and right window size, -1 means infinite
+
+    Returns:
+        output: (batch_size, seqlen_q, nheads, head_dim_v) - bf16
+    """
+    if causal:
+        window_size = (window_size[0], 0)
+
+    seqlen_q, seqlen_k = q_fp8.shape[1], k_fp8.shape[1]
+    d = q_fp8.shape[-1]
+
+    # FP8 E4M3 max value
+    fp8_max = torch.finfo(dtypes.fp8).max  # 448.0
+
+    # Dequantize fp8 inputs to fp32 for GEMM simulation
+    q = q_fp8.float()
+    k = k_fp8.float()
+    v = v_fp8.float()
+
+    # Handle GQA (grouped query attention)
+    k = repeat(k, "b s h d -> b s (h g) d", g=q_fp8.shape[2] // k_fp8.shape[2])
+    v = repeat(v, "b s h d -> b s (h g) d", g=q_fp8.shape[2] // v_fp8.shape[2])
+
+    # Step 1: QK^T GEMM (fp8 x fp8 -> fp32)
+    # Combined scale: scale_s = (1/sqrt(d)) * q_descale * k_descale
+    scale_s = (1.0 / math.sqrt(d)) * q_descale * k_descale
+    scores = torch.einsum("bthd,bshd->bhts", q, k) * scale_s
+
+    # Apply causal mask
+    if window_size[1] == 0:
+        mask = torch.triu(
+            torch.ones(seqlen_q, seqlen_k, device=q_fp8.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        scores.masked_fill_(mask, float("-inf"))
+
+    # Step 2: Softmax (fp32 -> fp32)
+    p = torch.softmax(scores, dim=-1)
+
+    # Step 3: P quantization (fp32 -> fp8)
+    # scale_p = fp8_max, P_fp8 = (P * scale_p).to(fp8)
+    scale_p = fp8_max
+    p_fp8 = (p * scale_p).to(dtypes.fp8)
+
+    # Step 4: PV GEMM (fp8 x fp8 -> fp32)
+    # Dequantize p_fp8 back to float for computation
+    p_dequant = p_fp8.float()
+    output = torch.einsum("bhts,bshd->bthd", p_dequant, v)
+
+    # Step 5: Output scaling and conversion (fp32 -> bf16)
+    # scale_o = v_descale / scale_p
+    scale_o = v_descale / scale_p
+    output = (output * scale_o).to(torch.bfloat16)
+
+    return output
 
 
 def run_ck(
@@ -80,15 +167,7 @@ def run_ck(
     ],
 )
 def test_flash_attn_output(
-    batch_size,
-    nheads,
-    nheads_k,
-    seqlen_q,
-    seqlen_k,
-    d,
-    d_v,
-    causal,
-    local,
+    batch_size, nheads, nheads_k, seqlen_q, seqlen_k, d, d_v, causal, local
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
