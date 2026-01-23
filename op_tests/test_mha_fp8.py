@@ -99,8 +99,11 @@ def attention_fp8_ref(
     # Online softmax: p = exp2(scale_s * scores - scale_s * row_max)
     # This is mathematically equivalent to: exp((1/sqrt(d)) * q_descale * k_descale * (scores - row_max))
     row_max = scores.max(dim=-1, keepdim=True).values
-    p = torch.exp2(scale_s * scores - scale_s * row_max)
-    p = p / p.sum(dim=-1, keepdim=True)
+    # Handle fully masked rows (all -inf) to avoid NaN from -inf - (-inf)
+    row_max = torch.where(torch.isinf(row_max), torch.zeros_like(row_max), row_max)
+    p = torch.exp2(scale_s * (scores - row_max))
+    p_sum = p.sum(dim=-1, keepdim=True)
+    p = p / p_sum.clamp(min=1e-9)  # Avoid division by zero
 
     # Step 3: P quantization (fp32 -> fp8)
     # scale_p = fp8_max, P_fp8 = (P * scale_p).to(fp8)
