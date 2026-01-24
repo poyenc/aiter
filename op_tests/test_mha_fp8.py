@@ -92,31 +92,37 @@ def attention_fp8_ref(
             )
         scores.masked_fill_(mask, float("-inf"))
 
-    # Step 2: Softmax using exp2 (FAST_EXP2 path)
+    # Step 2: Softmax using exp2 (FAST_EXP2 path) - online softmax style
     # scale_s = (1/sqrt(d)) * log2(e) * q_descale * k_descale
     scale_s = (1.0 / math.sqrt(d)) * log2e * q_descale * k_descale
 
-    # Online softmax: p = exp2(scale_s * scores - scale_s * row_max)
-    # This is mathematically equivalent to: exp((1/sqrt(d)) * q_descale * k_descale * (scores - row_max))
+    # Compute row max for numerical stability
     row_max = scores.max(dim=-1, keepdim=True).values
     # Handle fully masked rows (all -inf) to avoid NaN from -inf - (-inf)
     row_max = torch.where(torch.isinf(row_max), torch.zeros_like(row_max), row_max)
-    p = torch.exp2(scale_s * (scores - row_max))
-    p_sum = p.sum(dim=-1, keepdim=True)
-    p = p / p_sum.clamp(min=1e-9)  # Avoid division by zero
+
+    # IMPORTANT: This is UNNORMALIZED - kernel does NOT divide by sum before quantization
+    p_compute = torch.exp2(scale_s * (scores - row_max))
 
     # Step 3: P quantization (fp32 -> fp8)
-    # scale_p = fp8_max, P_fp8 = (P * scale_p).to(fp8)
+    # Kernel quantizes UNNORMALIZED p_compute: P_fp8 = (p_compute * scale_p).to(fp8)
     scale_p = fp8_max
-    p_fp8 = (p * scale_p).to(dtypes.fp8)
+    p_fp8 = (p_compute * scale_p).to(dtypes.fp8)
 
     # Step 4: PV GEMM (fp8 x fp8 -> fp32)
     # Dequantize p_fp8 back to float for computation
     p_dequant = p_fp8.float()
     output = torch.einsum("bhts,bshd->bthd", p_dequant, v)
 
-    # Step 5: Output scaling and conversion (fp32 -> bf16)
-    # scale_o = v_descale / scale_p
+    # Step 5: Output normalization and scaling
+    # In kernel: o_acc *= 1/l (where l is sum of unnormalized p)
+    # Then: o_acc *= scale_o where scale_o = v_descale / scale_p
+    p_sum = p_compute.sum(dim=-1, keepdim=True)  # Sum of unnormalized p
+    # p_sum shape is [b, h, t, 1], but output shape is [b, t, h, d]
+    # Need to permute p_sum to match: [b, h, t, 1] -> [b, t, h, 1]
+    p_sum_for_div = p_sum.permute(0, 2, 1, 3)
+    output = output / p_sum_for_div.clamp(min=1e-9)
+
     scale_o = v_descale / scale_p
     output = (output * scale_o).to(torch.bfloat16)
 
