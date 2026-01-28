@@ -56,3 +56,6 @@ aiter_logs
 # artifacts
 aiter_meta
 aiter/install_mode
+
+# AI agent config
+.claude
