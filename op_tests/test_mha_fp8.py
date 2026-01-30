@@ -150,6 +150,8 @@ def run_ck(
             v_descale,
             causal=causal,
             window_size=window_size,
+            num_iters=2,
+            num_warmup=0,
         )
     else:
         return run_perftest(
@@ -165,6 +167,8 @@ def run_ck(
             deterministic=True,
             return_lse=False,
             return_attn_probs=False,
+            num_iters=2,
+            num_warmup=0,
         )
 
 
