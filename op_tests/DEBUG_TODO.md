@@ -3,6 +3,40 @@
 ## Problem Description
 FP8 v3 kernel has an 8-lane offset bug in `load_tile_transpose()` causing V data to be read into wrong lanes.
 
+## Investigation Progress (2024-01-30)
+
+### Ruled Out (verified via static_assert)
+| Property | test_block_gemm (WORKS) | FMHA v3 (BUG) |
+|----------|-------------------------|---------------|
+| V window dim0 | 64 | 64 |
+| V window dim1 | 128 | 128 |
+| TransposedDstrEncode | identical | identical |
+| BlockGemm type | identical | identical |
+
+### Narrowed Down: LDS Layout Difference
+The key difference between test_block_gemm (works) and FMHA v3 (bug):
+
+| Aspect | test_block_gemm (WORKS) | FMHA v3 (BUG) |
+|--------|-------------------------|---------------|
+| LDS Store | `b_lds[idx] = b_global[idx]` | `async_load_tile_raw()` swizzled |
+| LDS View | `make_naive_tensor_view()` row-major | `MakeVLdsLoadBlockDescriptor()` 5D→2D |
+| Strides | `(128, 1)` row-major | Swizzled with dimension reordering |
+
+### Hypothesis
+The complex swizzled LDS layout from `async_load_tile_raw()` may not be compatible with how `load_tile_transpose()` expects data to be laid out.
+
+### Next Step: Test with async_load_tile()
+Replace `async_load_tile_raw()` with `async_load_tile()` to test if simpler LDS layout fixes the bug:
+1. `async_load_tile()` uses tile distribution for LDS offset calculation
+2. Allows using simple row-major LDS descriptors like test_block_gemm
+3. Eliminates complex swizzled store/load descriptor pairing
+
+**Files to modify:**
+- `block_fmha_fwd_v3_pipeline_default_policy.hpp`: Simplify LDS descriptors
+- `block_fmha_fwd_v3_pipeline.hpp`: Replace `async_load_tile_raw()` with `async_load_tile()`
+
+---
+
 ## Notice
 If encounter error 3 times and cannot make progress, ask user for help and let user to decide what to do next
 
@@ -549,3 +583,112 @@ The bug in `quad_output_ps_minor_offset` causes wrong indices in `ps_to_rhss_min
 - V reg distribution: `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_fwd_v3_pipeline_default_policy.hpp:189-224`
 - V transpose load: `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_fwd_v3_pipeline.hpp:735`
 - Test: `op_tests/test_mha_fp8.py`
+
+---
+
+## Investigation: Step 6 - LDS Contents Verification (2025-01-30)
+
+### K LDS Verification
+
+Added debug prints to dump full K LDS contents (64x128) in `block_fmha_fwd_v3_pipeline.hpp`.
+
+**Result:** K LDS contents are **CORRECT**
+
+```
+K_LDS[n= 0]: 7e fe fe fe ...   ← 0x7e at k=0 ✓
+K_LDS[n= 1]: fe 7e fe fe ...   ← 0x7e at k=1 ✓
+K_LDS[n= 2]: fe fe 7e fe ...   ← 0x7e at k=2 ✓
+...
+K_LDS[n= 8]: fe fe fe fe fe fe fe fe 7e fe ...   ← 0x7e at k=8 ✓
+...
+K_LDS[n=16]: ... 7e fe ...   ← 0x7e at k=16 ✓
+...
+K_LDS[n=31]: ... 7e fe ...   ← 0x7e at k=31 ✓
+K_LDS[n=32]: 00 00 00 00 ...   ← zeros (beyond seqlen_k=32) ✓
+```
+
+The diagonal pattern `K[n, n] = 0x7e (10.0)` and `K[n, other] = 0xfe (-10.0)` matches host test pattern.
+
+### V LDS Verification
+
+Previously verified that V LDS contents are also correct.
+
+### Thread Buffer After load_tile() for K
+
+```
+lane8 k_tile thread_buffer:  fe fe fe fe 7e fe fe fe ...  (0x7e at position 4)
+lane16 k_tile thread_buffer: fe fe fe fe fe fe fe fe 7e ... (0x7e at position 8)
+```
+
+### Current Status Summary
+
+| Component | Status |
+|-----------|--------|
+| K LDS contents | ✓ Correct |
+| V LDS contents | ✓ Correct |
+| K thread buffer after load_tile() | Needs coordinate mapping verification |
+| V thread buffer after load_tile_transpose() | Has 8-lane offset bug |
+| Output (o_acc) | Row 8 has V[16] data, Row 16 is empty |
+
+### Next Steps
+
+1. ~~Verify coordinate mapping in `load_tile()` for K - check if thread buffer positions map to correct (n, k) coordinates~~
+2. ~~Re-examine `load_tile_transpose()` for V - the bug is confirmed in V loading path~~
+3. ~~The root cause is still the `quad_output_ps_minor_offset` calculation in `load_tile_transpose.hpp`~~
+
+---
+
+## Investigation: Step 7 - Q Tile Lane Mapping Test (2025-01-30)
+
+### Test Setup
+
+Modified Q initialization to test lane-to-row mapping:
+- Q row 8: all 2.0 → quantized to 0x79 (288.0 in FP8)
+- Q row 16: all 3.0 → quantized to 0x7e (448.0 in FP8)
+- All other rows: zeros
+
+### Results
+
+**Host quantized Q values:**
+```
+q_quant[row=0, :16] bytes: ['00', '00', ...] (zeros)
+q_quant[row=8, :16] bytes: ['79', '79', ...] (288.0 in FP8)
+q_quant[row=16, :16] bytes: ['7e', '7e', ...] (448.0 in FP8)
+```
+
+**Device q_tile thread buffer:**
+```
+lane8:  79 79 79 79 ...  ← Row 8 data ✓
+lane16: 7e 7e 7e 7e ...  ← Row 16 data ✓
+```
+
+**Conclusion:** Q loading with `load_tile()` has CORRECT lane-to-row mapping.
+
+### Updated Status Summary
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Q tile loading (`load_tile()`) | ✓ Correct | Lane 8 → Row 8, Lane 16 → Row 16 |
+| K LDS contents | ✓ Correct | Diagonal pattern matches host |
+| V LDS contents | ✓ Correct | Previously verified |
+| sp_compute (QK GEMM output) | ✗ **Row-swapped** | Bug occurs BEFORE PV GEMM |
+| o_acc (final output) | ✗ Row-swapped | Same issue as sp_compute |
+
+### Key Finding
+
+**The bug occurs BEFORE PV GEMM** - the `sp_compute` (softmax output from QK GEMM) already has the row-swapped issue.
+
+This means the bug is NOT in:
+- V loading (`load_tile_transpose()`)
+- PV GEMM
+
+The bug must be in one of:
+1. K loading (`load_tile()`) - lane-to-row mapping might be wrong
+2. QK GEMM computation itself
+3. How Q and K tiles are used in gemm_0
+
+### Next Investigation
+
+1. Add debug prints to verify K tile lane-to-row mapping (similar to Q test)
+2. Check sp_compute values for lanes 8 and 16 after QK GEMM
+3. Trace through gemm_0 to understand how Q[i] × K[j] produces S[i,j]
