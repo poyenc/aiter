@@ -57,5 +57,6 @@ aiter_logs
 aiter_meta
 aiter/install_mode
 
-# AI agent config
-.claude
+# AI agent config (keep .claude/*.md for documentation)
+.claude/*
+!.claude/*.md
