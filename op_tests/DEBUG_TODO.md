@@ -1,7 +1,108 @@
-# FP8 FMHA v3 Transpose Load Bug
+# FP8 FMHA v3 Pipeline Debug Notes
 
-## Problem Description
+## Issue Summary (2025-01-31)
+
+| Issue | Status | Affects | Root Cause |
+|-------|--------|---------|------------|
+| [K Tile Half-Stride Bug](#investigation-k-tile-half-stride-bug-2024-01-30) | ✓ FIXED | All FP8, small seqlen | SwizzleB warp GEMM encoding has half-stride in BWarpDstrEncoding |
+| [Causal + Large Seqlen Bug](#issue-causal--large-sequence-length-bug-open) | 🔴 OPEN | causal=True, seqlen≥256 | Unknown (under investigation) |
+| [V Tile Transpose Load Bug](#current-status---partial-fix-applied) | ⚠️ BYPASSED | FP8 V tile loading | `quad_output_ps_minor_offset` coordinate mismatch |
+
+---
+
+## Test Commands
+
+```bash
+# Run all pytest tests (48 fail for causal+large seqlen)
+docker exec poyenc-ck bash -c "cd /root/workspace/worktree/aiter-main && rm -f aiter/jit/*.so && python -m pytest op_tests/test_mha_fp8.py -v --tb=short"
+
+# Test small seqlen (should PASS with fix)
+docker exec poyenc-ck bash -c "cd /root/workspace/worktree/aiter-main && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 1 -q 32 -k 32 -d 128 -dv 128"
+
+# Test small seqlen + causal (should PASS with fix)
+docker exec poyenc-ck bash -c "cd /root/workspace/worktree/aiter-main && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 1 -q 32 -k 32 -d 128 -dv 128 -c"
+
+# Test large seqlen + causal (FAILS - open issue)
+docker exec poyenc-ck bash -c "cd /root/workspace/worktree/aiter-main && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 8 -q 256 -k 256 -d 128 -dv 128 -c"
+
+# Test large seqlen without causal (should PASS)
+docker exec poyenc-ck bash -c "cd /root/workspace/worktree/aiter-main && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 8 -q 256 -k 256 -d 128 -dv 128"
+```
+
+---
+
+## Issue: Causal + Large Sequence Length Bug (OPEN)
+
+### Status: 🔴 OPEN
+
+### Symptom
+- Tests fail only when **causal=True** AND **seqlen ≥ 256**
+- All causal=False tests pass regardless of sequence length
+- All small sequence tests (seqlen < 256) pass regardless of causal setting
+
+### Test Results (2025-01-31)
+
+Full pytest run with K tile half-stride fix enabled:
+
+| Sequence Length | causal=False | causal=True |
+|-----------------|--------------|-------------|
+| 32, 108, 113, 128 | ✓ PASS | ✓ PASS |
+| 256, 512 | ✓ PASS | ❌ FAIL |
+| 1023, 1024 | ✓ PASS | ❌ FAIL |
+| 2048, 4096 | ✓ PASS | ❌ FAIL |
+
+**Result:** 48 failed, 128 passed
+
+### Hypothesis
+The bug likely involves one of:
+1. **Multi-tile iteration:** When seqlen > tile size (64), requires multiple K/V tile loops
+2. **Causal mask across tile boundaries:** Mask calculation when attention spans multiple tiles
+3. **Online softmax state:** `m` (max) and `l` (sum) accumulator updates across tiles
+4. **V tile transpose load:** The `load_tile_transpose()` issue (bypassed but may have runtime issues)
+
+### Next Steps
+1. Add debug prints to compare GPU vs reference for seqlen=256, causal=True
+2. Check if issue is in online softmax accumulator rescaling
+3. Check causal mask tile boundary handling in v3 pipeline
+4. Compare with async_trload pipeline behavior
+
+---
+
+## K Tile Half-Stride Fix Details
+
+### Fix Location
+**File:** `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_fwd_v3_pipeline_default_policy.hpp`
+
+```cpp
+// Line ~267 in GetQKBlockGemm()
+#if 1  // Set to 0 to use buggy SwizzleB version
+    // FIXED: Use non-SwizzleB version with correct lane-to-row mapping
+    return WarpGemmMfma_f32_32x32x32_fp8_fp8_CTransposed<>{};
+#else
+    // BUGGY: SwizzleB has half-stride in BWarpDstrEncoding
+    constexpr index_t swizzle_factor = 4;
+    return WarpGemmMfmaFp8Fp8F32M32N32K32SwizzleBTransposedCDistribution<swizzle_factor>{};
+#endif
+```
+
+### Equivalence with async_trload Policy
+
+After fix, v3 policy's `GetQKBlockGemm()` matches async_trload policy for all data types:
+
+| Data Type | Warp GEMM Type (via WarpGemmDispatcher) |
+|-----------|----------------------------------------|
+| FP8 | `WarpGemmMfma_f32_32x32x32_fp8_fp8_CTransposed<>` |
+| FP16 | `WarpGemmMfmaF16F16F32M32N32K16TransposedCDistribution<>` |
+| BF16 | `WarpGemmMfmaBf16Bf16F32M32N32K16TransposedCDistribution<>` |
+
+---
+
+# Historical Investigation Notes
+
+## Original Problem Description
 FP8 v3 kernel has an 8-lane offset bug in `load_tile_transpose()` causing V data to be read into wrong lanes.
+
+**Update (2025-01-31):** The actual root cause was the K tile half-stride bug, not V tile transpose load. The V tile investigation was a red herring, but documented below for reference.
 
 ## Investigation Progress (2024-01-30)
 
@@ -692,3 +793,198 @@ The bug must be in one of:
 1. Add debug prints to verify K tile lane-to-row mapping (similar to Q test)
 2. Check sp_compute values for lanes 8 and 16 after QK GEMM
 3. Trace through gemm_0 to understand how Q[i] × K[j] produces S[i,j]
+
+---
+
+## Investigation: Q Tile Lane-to-Column Mapping (2024-01-30)
+
+### Test Pattern
+
+Filled Q rows with alternating values every 16 elements:
+```python
+# Q[row, 0:16] = row_base, Q[row, 16:32] = row_base+0.1, etc.
+for i in range(seqlen_q):
+    row_base = (i + 1) * 1.0
+    for chunk in range(d // 16):
+        q[:, i, :, chunk*16:(chunk+1)*16] = row_base + chunk * 0.1
+```
+
+### Host Q Row 0 (128 columns, 8 chunks of 16):
+
+| Chunk | Columns | Value | FP8 hex |
+|-------|---------|-------|---------|
+| 0 | 0-15 | 1.0 | 0x56 |
+| 1 | 16-31 | 1.1 | 0x57 |
+| 2 | 32-47 | 1.2 | 0x58 |
+| 3 | 48-63 | 1.3 | 0x59 |
+| 4 | 64-79 | 1.4 | 0x5a |
+| 5 | 80-95 | 1.5 | 0x5a |
+| 6 | 96-111 | 1.6 | 0x5b |
+| 7 | 112-127 | 1.7 | 0x5c |
+
+### Kernel Lane Q Tile Thread Buffer:
+
+| Lane | Buffer positions 0-15 | Buffer positions 16-31 | Buffer positions 32-47 | Buffer positions 48-63 |
+|------|----------------------|------------------------|------------------------|------------------------|
+| Lane 0 | 0x56 (chunk 0) | 0x58 (chunk 2) | 0x5a (chunk 4) | 0x5b (chunk 6) |
+| Lane 32 | 0x57 (chunk 1) | 0x59 (chunk 3) | 0x5a (chunk 5) | 0x5c (chunk 7) |
+
+### Conclusion: Interleaved Chunk Pattern
+
+**Lane N and Lane N+32 together form row N's complete Q data:**
+- Lane N has **even chunks** (0, 2, 4, 6) → columns 0-15, 32-47, 64-79, 96-111
+- Lane N+32 has **odd chunks** (1, 3, 5, 7) → columns 16-31, 48-63, 80-95, 112-127
+
+This is the correct MFMA layout for register tile distribution - Q loading is working correctly!
+
+---
+
+## Investigation: K Tile Half-Stride Bug (2024-01-30)
+
+### Test Pattern
+
+Same alternating pattern as Q test applied to K:
+```python
+# K[row, 0:16] = row_base, K[row, 16:32] = row_base+0.1, etc.
+for j in range(seqlen_k):
+    row_base = (j + 1) * 1.0
+    for chunk in range(d // 16):
+        k[:, j, :, chunk*16:(chunk+1)*16] = row_base + chunk * 0.1
+```
+
+### Host K Values (seqlen_k=64):
+
+| Row | First byte (hex) |
+|-----|------------------|
+| 0 | 0x4e |
+| 4 | 0x61 |
+| 8 | 0x68 |
+| 16 | 0x6f |
+
+### Kernel K Tile Thread Buffer:
+
+| Lane | First 32 bytes | Expected row | Actual row |
+|------|----------------|--------------|------------|
+| Lane 0 | 0x4e, 0x50... | row 0 | row 0 ✓ |
+| Lane 32 | 0x4f, 0x51... | row 0 (odd chunks) | row 0 ✓ |
+| Lane 8 | 0x61 all | row 8 | row 4 ✗ |
+| Lane 40 | 0x61 all | row 8 (odd chunks) | row 4 ✗ |
+| Lane 16 | 0x68 all | row 16 | row 8 ✗ |
+| Lane 48 | 0x68 all | row 16 (odd chunks) | row 8 ✗ |
+
+### Bug Identified: K Tile Half-Stride
+
+**Lane N gets K row N/2 instead of row N!**
+
+- Lane 0 → row 0 (0/2=0) ✓
+- Lane 8 → row 4 (8/2=4) ✗ should be row 8
+- Lane 16 → row 8 (16/2=8) ✗ should be row 16
+
+The K tile distribution has a stride that is half of what it should be.
+
+### Root Cause
+
+The v3 pipeline used `WarpGemmMfmaFp8Fp8F32M32N32K32SwizzleBTransposedCDistribution` for FP8 QK GEMM, which has a SwizzleB encoding with half-stride in BWarpDstrEncoding. This caused the K tile loading from LDS to have incorrect row mapping.
+
+### Fix Applied (2024-01-30)
+
+**Two changes made to `block_fmha_fwd_v3_pipeline_default_policy.hpp`:**
+
+1. **Changed FP8 warp GEMM** (line ~267): Replace SwizzleB version with non-SwizzleB version
+   ```cpp
+   // OLD (buggy):
+   return WarpGemmMfmaFp8Fp8F32M32N32K32SwizzleBTransposedCDistribution<swizzle_factor>{};
+
+   // NEW (fixed):
+   return WarpGemmMfma_f32_32x32x32_fp8_fp8_CTransposed<>{};
+   ```
+
+2. **Updated MakeKRegTileDistribution()** (line ~165): Match async_trload pattern for proper block-level distribution encoding.
+
+### Result
+
+- K tile half-stride bug: **FIXED**
+- Lane 8 now correctly gets K row 8 (was getting row 4)
+- Lane 16 now correctly gets K row 16 (was getting row 8)
+- 8-lane offset bug in output: **FIXED**
+- Test passes with max diff 0.035 < threshold 0.055
+
+---
+
+## Investigation: Causal + Large Seqlen Failure (2025-01-31)
+
+### Experiment: Full Pytest Run with K Tile Fix
+
+After applying the K tile half-stride fix, ran full pytest suite:
+
+```bash
+docker exec poyenc-ck bash -c "cd /root/workspace/worktree/aiter-main && rm -f aiter/jit/*.so && python -m pytest op_tests/test_mha_fp8.py -v --tb=short"
+```
+
+### Results
+
+**48 failed, 128 passed**
+
+All failures follow a pattern:
+- **causal=True** (all causal=False pass)
+- **seqlen ≥ 256** (all seqlen < 256 pass)
+
+| Sequence Length | causal=False | causal=True |
+|-----------------|--------------|-------------|
+| 32, 108, 113, 128 | ✓ PASS | ✓ PASS |
+| 256, 512 | ✓ PASS | ❌ FAIL |
+| 1023, 1024 | ✓ PASS | ❌ FAIL |
+| 2048, 4096 | ✓ PASS | ❌ FAIL |
+
+### Analysis
+
+The K tile half-stride fix resolved the lane mapping issue for small sequences. However, a separate bug exists when:
+1. Causal masking is enabled
+2. Sequence length requires multiple tile iterations (seqlen ≥ 256, tile size = 64)
+
+This suggests the bug is in one of:
+- **Multi-tile K/V loop:** How tiles are iterated when seqlen > tile size
+- **Causal mask at tile boundaries:** Mask calculation across tile boundaries
+- **Online softmax rescaling:** `m` and `l` accumulator updates between tiles
+- **V tile transpose load:** The bypassed `load_tile_transpose()` issue may have runtime effects
+
+### Verification: Causal=True/False with Small Seqlen
+
+```bash
+# Both pass with small seqlen
+docker exec poyenc-ck bash -c "... python op_tests/test_mha_fp8.py -b 1 -n 1 -q 32 -k 32 -d 128 -dv 128"      # PASS
+docker exec poyenc-ck bash -c "... python op_tests/test_mha_fp8.py -b 1 -n 1 -q 32 -k 32 -d 128 -dv 128 -c"   # PASS
+```
+
+Output for both:
+```
+GPU output row 8 sum: 0.000000, row 16 sum: 64.500000
+Reference row 8 sum: ~0, row 16 sum: 65.000000
+Output max diff: 0.035
+```
+
+### Next Steps
+
+1. Debug seqlen=256, causal=True case
+2. Add prints for online softmax m/l values across tile iterations
+3. Check causal mask tile boundary logic in v3 pipeline
+4. Compare v3 vs async_trload pipeline behavior for same config
+
+---
+
+## Key Files Reference
+
+| Component | File Path |
+|-----------|-----------|
+| v3 Pipeline Policy | `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_fwd_v3_pipeline_default_policy.hpp` |
+| v3 Pipeline | `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_fwd_v3_pipeline.hpp` |
+| async_trload Policy | `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs_async_trload_policy.hpp` |
+| Transpose Load | `3rdparty/composable_kernel/include/ck_tile/core/tensor/load_tile_transpose.hpp` |
+| Warp GEMM Dispatcher | `3rdparty/composable_kernel/include/ck_tile/ops/gemm/warp/warp_gemm_dispatcher.hpp` |
+| Test | `op_tests/test_mha_fp8.py` |
+
+---
+
+## Notice
+
+If encounter error 3 times and cannot make progress, ask user for help and let user decide what to do next.
