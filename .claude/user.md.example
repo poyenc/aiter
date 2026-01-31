@@ -1,0 +1,23 @@
+# User Preferences (Example)
+
+Copy this file to `user.md` and customize for your preferences.
+
+## Environment
+
+```bash
+# Docker container name
+CONTAINER=poyenc-ck
+
+# Workspace path inside container
+WORKSPACE=/root/workspace/worktree/aiter-main
+```
+
+## Preferences
+
+- Preferred editor: vim
+- Commit message style: conventional commits
+- Test command preferences: pytest with verbose output
+
+## Notes
+
+Add any personal notes or reminders here.
