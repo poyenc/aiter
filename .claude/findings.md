@@ -817,7 +817,7 @@ The v3 pipeline used `WarpGemmMfmaFp8Fp8F32M32N32K32SwizzleBTransposedCDistribut
 After applying the K tile half-stride fix, ran full pytest suite:
 
 ```bash
-docker exec poyenc-ck bash -c "cd /root/workspace/worktree/aiter-main && rm -f aiter/jit/*.so && python -m pytest op_tests/test_mha_fp8.py -v --tb=short"
+docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python -m pytest op_tests/test_mha_fp8.py -v --tb=short"
 ```
 
 ### Results

@@ -8,6 +8,8 @@
 | #2 | [Causal + Large Seqlen Bug](#issue-2-causal--large-seqlen-bug) | 🔴 OPEN | causal=True, seqlen≥256 | Unknown |
 | #3 | [V Tile Transpose Load Bug](#issue-3-v-tile-transpose-load-bug) | ⚠️ BYPASSED | FP8 V tile loading | Coordinate mismatch |
 
+> **Note:** Replace `<CONTAINER>` and `<WORKSPACE>` with values from `.claude/user.md`
+
 ---
 
 ## Issue #1: K Tile Half-Stride Bug
@@ -38,7 +40,7 @@ Changed to `WarpGemmMfma_f32_32x32x32_fp8_fp8_CTransposed<>` in `GetQKBlockGemm(
 ```bash
 # 1. Set #if 0 in the fix location above
 # 2. Run test
-docker exec poyenc-ck bash -c "cd /root/workspace/worktree/aiter-main && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 1 -q 32 -k 32 -d 128 -dv 128"
+docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 1 -q 32 -k 32 -d 128 -dv 128"
 ```
 
 ### Test Results
@@ -63,10 +65,10 @@ Unknown. Under investigation.
 ### Reproduction
 ```bash
 # Fails
-docker exec poyenc-ck bash -c "cd /root/workspace/worktree/aiter-main && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 8 -q 256 -k 256 -d 128 -dv 128 -c"
+docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 8 -q 256 -k 256 -d 128 -dv 128 -c"
 
 # Passes (same config, no causal)
-docker exec poyenc-ck bash -c "cd /root/workspace/worktree/aiter-main && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 8 -q 256 -k 256 -d 128 -dv 128"
+docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 8 -q 256 -k 256 -d 128 -dv 128"
 ```
 
 ### Test Results (2025-01-31)
@@ -90,7 +92,7 @@ Full pytest run with Issue #1 fix applied:
 
 ### Run All Tests
 ```bash
-docker exec poyenc-ck bash -c "cd /root/workspace/worktree/aiter-main && rm -f aiter/jit/*.so && python -m pytest op_tests/test_mha_fp8.py -v --tb=short"
+docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python -m pytest op_tests/test_mha_fp8.py -v --tb=short"
 ```
 
 ---

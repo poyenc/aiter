@@ -15,6 +15,32 @@
    - Update `session.md` with latest progress and next steps
    - Commit `.claude/*.md` files with a summary of progress
 
+## Build and Run Environment
+
+User-specific settings are in `.claude/user.md` (see `.claude/user.md.example` for template).
+
+### Docker Container
+```bash
+# Use container name from .claude/user.md or user.md.example
+docker exec -it <CONTAINER> bash
+```
+
+### Build & Run
+Run any Python script that invokes a `@compile_ops` annotated function.
+This triggers JIT HIP kernel compilation and loads the compiled `.so` under `aiter/jit/`.
+
+### Clean Rebuild
+If kernel code changed, remove related `.so` before running:
+```bash
+rm aiter/jit/*.so
+```
+
+### Example
+```bash
+# Inside container
+rm -f aiter/jit/*.so && python -m pytest op_tests/test_mha_fp8.py -v
+```
+
 ## Technical Documentation
 
 - [Session Notes](.claude/session.md) - Progress, hypothesis, TODO, and next steps
