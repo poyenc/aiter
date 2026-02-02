@@ -190,11 +190,20 @@ For Issue #2 (causal + large seqlen), remaining possibilities:
 4. ~~FP8 scale_p mismatch~~ (RULED OUT - scale_p = 448 is correct)
 5. ~~Causal mask off-by-one~~ (RULED OUT - kernel mask decisions are correct)
 
-6. **`set_tile_if` tile index mapping** (HIGH - CURRENT FOCUS)
-   - When masking is disabled (`#if 0`), causal=True and causal=False produce **identical** output (diff=0.0)
-   - When masking is enabled, causal=True fails with diff=0.28
-   - The mask predicate returns correct values (row 8 correctly masks cols 9+)
-   - **Suspicion:** `set_tile_if` may incorrectly map distributed indices to global (row, col) for v3's sp_compute distribution
+6. **`set_tile_if` with IsMasking=true** (HIGH - CURRENT FOCUS)
+
+### Experiment Results (seqlen_q=32, seqlen_k=32)
+
+| Case | set_tile_if Status | causal=True | causal=False |
+|------|-------------------|-------------|--------------|
+| 1 | Disabled for BOTH | 0.143 (fail) | 0.031 (pass) |
+| 2 | Disabled for IsMasking=true only | 0.486 (fail) | 0.031 (pass) |
+| Normal | Enabled for BOTH | 0.277 (fail) | 0.031 (pass) |
+
+**Conclusions:**
+- Case 1: Kernel outputs identical for both causal flags when no masking applied
+- Case 2: IsMasking=false path works correctly with `set_tile_if` enabled
+- **Bug is specific to IsMasking=true path**
 
 ---
 
@@ -202,12 +211,20 @@ For Issue #2 (causal + large seqlen), remaining possibilities:
 
 - [x] Verify scale_p value at runtime → 448 (correct)
 - [x] Verify mask formula matches reference → correct
-- [x] Remove debug prints from kernel
 - [x] Compare GEMM config between v3 and async_trload
-- [x] Try changing v3 GEMM1 GemmLoopOrder from MNK to KMN → **TESTED, NOT THE BUG** (changed P+V distributions to match, test still fails with same diff 0.27-0.29)
-- [ ] Trace GEMM1 (P×V) output for specific lanes
-- [ ] Compare o_acc values before/after rescaling with reference
-- [ ] Check if issue is in final O normalization (O = o_acc / l * scale_o)
+- [x] Try changing v3 GEMM1 GemmLoopOrder from MNK to KMN → NOT THE BUG
+- [x] Confirm `set_tile_if` works for IsMasking=false path
+- [ ] **Investigate why IsMasking=true path produces wrong results**
+- [ ] Compare with async_trload's masking implementation
+- [ ] Print FULL intermediate values (32+ elements, not just 4-8) when debugging
+
+---
+
+## Best Practices
+
+1. **Print more values:** When comparing kernel registers with reference, print 32+ elements, not just first 4-8. Matching on few elements doesn't mean all match.
+
+2. **Batch kernel changes:** Debug prints require expensive recompilation. Plan all changes at once rather than incrementally.
 
 ---
 
