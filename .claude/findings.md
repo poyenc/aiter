@@ -64,11 +64,42 @@ Output max diff (bf16 ref vs online ref): 0.03515625
 
 The two references agree (diff=0.035), but kernel differs by ~0.27-0.29.
 
+### GEMM Config Comparison: v3 vs async_trload (2026-02-02)
+
+Compared `GetQKBlockGemm` and `GetPVBlockGemm` between:
+- v3: `block_fmha_fwd_v3_pipeline_default_policy.hpp`
+- async_trload: `block_fmha_pipeline_qr_ks_vs_async_trload_policy.hpp`
+
+**GetQKBlockGemm (GEMM0: Q × K):**
+| Aspect | v3 Pipeline | async_trload Pipeline |
+|--------|-------------|----------------------|
+| WarpGemm | Explicit: `WarpGemmMfma_f32_32x32x32_fp8_fp8_CTransposed<>{}` | Dispatcher: `WarpGemmDispatcher<..., true>` |
+| GemmLoopOrder | `MNK` | `MNK` |
+
+Both use `MNK` - no difference for GEMM0.
+
+**GetPVBlockGemm (GEMM1: P × V):**
+| Aspect | v3 Pipeline | async_trload Pipeline |
+|--------|-------------|----------------------|
+| WGAttrNumAccessEnum | Always `Double` | Conditional: `Double` only for (16×32) or (32×16), else `Single` |
+| GemmLoopOrder | **`MNK`** | **`KMN`** |
+
+**Key finding:** v3 uses `GemmLoopOrder::MNK` while async_trload uses `GemmLoopOrder::KMN` for GEMM1.
+
+**GemmLoopOrder semantics (from block_gemm_areg_breg_creg_v2.hpp):**
+- `KMN`: Outer loop order K → M → N (loops over K first, accumulation-oriented)
+- `MNK`: Outer loop order M → N → K (loops over M, N first, row/col-oriented)
+
+**Potential impact:** Different loop order affects how partial products accumulate. For P×V with causal masking where some P rows are partially or fully zeroed, the accumulation order may produce different intermediate rounding behavior.
+
+**Next step:** Try changing v3 GEMM1 to use `GemmLoopOrder::KMN` and test if this fixes the causal + large seqlen bug.
+
 ### Remaining Investigation Areas
 
-1. **P×V GEMM (gemm_1)** - P values appear correct, but o_acc differs from reference
-2. **Online softmax rescaling** - `o_acc *= exp2(scale_s * (m_old - m_new))` when some lanes are all-masked
-3. **Final O normalization** - `O = o_acc / l * scale_o`
+1. **GemmLoopOrder mismatch** (NEW) - v3 uses `MNK`, async_trload uses `KMN` for GEMM1
+2. **P×V GEMM (gemm_1)** - P values appear correct, but o_acc differs from reference
+3. **Online softmax rescaling** - `o_acc *= exp2(scale_s * (m_old - m_new))` when some lanes are all-masked
+4. **Final O normalization** - `O = o_acc / l * scale_o`
 
 ---
 

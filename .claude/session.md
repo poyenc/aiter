@@ -118,21 +118,52 @@ Example with seqlen_q=256, seqlen_k=64:
 
 ---
 
+## GEMM Config Comparison: v3 vs async_trload
+
+### GetQKBlockGemm (GEMM0: Q × K)
+
+| Aspect | v3 Pipeline | async_trload Pipeline |
+|--------|-------------|----------------------|
+| WarpGemm | Explicit: `WarpGemmMfma_f32_32x32x32_fp8_fp8_CTransposed<>{}` | Dispatcher: `WarpGemmDispatcher<..., true>` |
+| GemmLoopOrder | `MNK` | `MNK` |
+
+Both use `GemmLoopOrder::MNK` - **no difference**.
+
+### GetPVBlockGemm (GEMM1: P × V) - **KEY DIFFERENCES**
+
+| Aspect | v3 Pipeline | async_trload Pipeline |
+|--------|-------------|----------------------|
+| WGAttrNumAccessEnum | Always `Double` | Conditional: `Double` only for (16×32) or (32×16), else `Single` |
+| GemmLoopOrder | **`MNK`** | **`KMN`** |
+
+**GemmLoopOrder difference is significant:**
+- `KMN`: Outer loop K → M → N (loops over K first, accumulation-oriented)
+- `MNK`: Outer loop M → N → K (loops over M, N first, row/col-oriented)
+
+**Potential impact:** The loop order affects how partial products are accumulated. For P×V with causal masking, when P rows have all-zero masked elements, the order of accumulation may produce different intermediate states.
+
+---
+
 ## Hypothesis
 
 For Issue #2 (causal + large seqlen), remaining possibilities:
 
-1. **P×V GEMM computation** (HIGH)
+1. **GemmLoopOrder mismatch** (HIGH - NEW)
+   - v3 uses `MNK` for GEMM1, async_trload uses `KMN`
+   - May affect accumulation order when P rows are partially/fully masked
+   - Needs investigation: does changing to `KMN` fix the issue?
+
+2. **P×V GEMM computation** (HIGH)
    - The P values are correct, V loading appears correct
    - But o_acc output differs from reference
    - May be issue in GEMM1 (P×V) data layout or accumulation
 
-2. **Online softmax rescaling** (MEDIUM)
+3. **Online softmax rescaling** (MEDIUM)
    - The `o_acc *= exp2(scale_s * (m_old - m_new))` rescaling
    - May have issue when some lanes have all-masked P values
 
-3. ~~FP8 scale_p mismatch~~ (RULED OUT - scale_p = 448 is correct)
-4. ~~Causal mask off-by-one~~ (RULED OUT - kernel mask is correct)
+4. ~~FP8 scale_p mismatch~~ (RULED OUT - scale_p = 448 is correct)
+5. ~~Causal mask off-by-one~~ (RULED OUT - kernel mask is correct)
 
 ---
 
@@ -141,6 +172,8 @@ For Issue #2 (causal + large seqlen), remaining possibilities:
 - [x] Verify scale_p value at runtime → 448 (correct)
 - [x] Verify mask formula matches reference → correct
 - [x] Remove debug prints from kernel
+- [x] Compare GEMM config between v3 and async_trload
+- [ ] **Try changing v3 GEMM1 GemmLoopOrder from MNK to KMN**
 - [ ] Trace GEMM1 (P×V) output for specific lanes
 - [ ] Compare o_acc values before/after rescaling with reference
 - [ ] Check if issue is in final O normalization (O = o_acc / l * scale_o)
@@ -170,9 +203,13 @@ docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && pytho
 **IMPORTANT:** Always run `pytest op_tests/test_mha_fp8.py` to verify any fix before documenting conclusions.
 
 ### Key Files
-- v3 Kernel: `3rdparty/composable_kernel/.../fmha_fwd_v3_kernel.hpp`
-- v3 Pipeline: `3rdparty/composable_kernel/.../block_fmha_fwd_v3_pipeline.hpp`
-- Masking: `3rdparty/composable_kernel/.../block_masking.hpp`
+- v3 Kernel: `3rdparty/composable_kernel/include/ck_tile/ops/fmha/kernel/fmha_fwd_v3_kernel.hpp`
+- v3 Pipeline: `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_fwd_v3_pipeline.hpp`
+- v3 Policy: `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_fwd_v3_pipeline_default_policy.hpp`
+- async_trload Pipeline: `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs_async_trload.hpp`
+- async_trload Policy: `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs_async_trload_policy.hpp`
+- Masking: `3rdparty/composable_kernel/include/ck_tile/ops/fmha/block/block_masking.hpp`
+- Block GEMM: `3rdparty/composable_kernel/include/ck_tile/ops/gemm/block/block_gemm_areg_breg_creg_v2.hpp`
 - Test: `op_tests/test_mha_fp8.py`
 
 ### Related Docs

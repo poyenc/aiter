@@ -189,8 +189,11 @@ python -m pytest op_tests/test_mha_fp8.py -v -k "256" --tb=short
 
 | Component | File |
 |-----------|------|
-| v3 Pipeline Policy | `3rdparty/composable_kernel/.../block_fmha_fwd_v3_pipeline_default_policy.hpp` |
-| v3 Pipeline | `3rdparty/composable_kernel/.../block_fmha_fwd_v3_pipeline.hpp` |
-| v3 Kernel | `3rdparty/composable_kernel/.../fmha_fwd_v3_kernel.hpp` |
-| Masking | `3rdparty/composable_kernel/.../block_masking.hpp` |
+| v3 Kernel | `3rdparty/composable_kernel/include/ck_tile/ops/fmha/kernel/fmha_fwd_v3_kernel.hpp` |
+| v3 Pipeline | `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_fwd_v3_pipeline.hpp` |
+| v3 Policy | `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_fwd_v3_pipeline_default_policy.hpp` |
+| async_trload Pipeline | `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs_async_trload.hpp` |
+| async_trload Policy | `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs_async_trload_policy.hpp` |
+| Masking | `3rdparty/composable_kernel/include/ck_tile/ops/fmha/block/block_masking.hpp` |
+| Block GEMM | `3rdparty/composable_kernel/include/ck_tile/ops/gemm/block/block_gemm_areg_breg_creg_v2.hpp` |
 | Test | `op_tests/test_mha_fp8.py` |
