@@ -6,6 +6,72 @@ For current status and open issues, see [session.md](session.md).
 
 ---
 
+## Issue #2 Investigation (2026-02-02)
+
+### Ruled Out Hypotheses
+
+#### 1. FP8 scale_p Mismatch - RULED OUT
+
+**Initial Hypothesis:** `scale_p` was incorrectly computed as 126 instead of 448.
+
+**Investigation:**
+```
+[SCALE_DEBUG] scale_p=448.0000 (CORRECT!)
+[SCALE_DEBUG] hw_builtin(0x7e)=448.0
+```
+
+**Conclusion:** scale_p = 448 is correct. The `(float)numeric<fp8_t>::max()` returning 126.0 only affects debug print formatting, not the actual computation path which uses `type_convert<float>()`.
+
+#### 2. Causal Mask Off-by-One - RULED OUT
+
+**Initial Hypothesis:** The mask formula in block_masking.hpp had an off-by-one error.
+
+**Investigation:**
+- Kernel mask: `x = 1 + right_size + x_tmp`, `x_end = min(i_y + x, x_total)`, masked if `col >= x_end`
+- Reference mask: `mask = col > row + seqlen_k - seqlen_q + window_size[1]`
+- For causal with `window_size[1] = 0`: both formulas give same result
+
+**Verified via debug prints:**
+```
+[MASK LANE4] tile_idx=(196,0) row=196 col=0 should_mask=0
+[MASK LANE4] tile_idx=(196,1) row=196 col=1 should_mask=0
+[MASK LANE4] tile_idx=(196,2) row=196 col=2 should_mask=0
+[MASK LANE4] tile_idx=(196,3) row=196 col=3 should_mask=0
+[MASK LANE36] tile_idx=(196,4) row=196 col=4 should_mask=0
+[MASK LANE36] tile_idx=(196,5) row=196 col=5 should_mask=1
+```
+
+Row 196 with seqlen_q=256, seqlen_k=64: valid cols = {0,1,2,3,4} (5 positions) - matches reference.
+
+**Conclusion:** Kernel mask is correct. No off-by-one bug.
+
+#### 3. m (row max) and l (row sum) - VERIFIED CORRECT
+
+Previously verified via debug prints that m and l values match reference.
+
+### Current Test Failure
+
+```bash
+python op_tests/test_mha_fp8.py -b 1 -n 1 -q 256 -k 64 -d 128 -dv 128 -c
+```
+
+**Output:**
+```
+Output max diff (kernel vs bf16 ref): 0.287109375
+Output max diff (kernel vs online ref): 0.271484375
+Output max diff (bf16 ref vs online ref): 0.03515625
+```
+
+The two references agree (diff=0.035), but kernel differs by ~0.27-0.29.
+
+### Remaining Investigation Areas
+
+1. **P×V GEMM (gemm_1)** - P values appear correct, but o_acc differs from reference
+2. **Online softmax rescaling** - `o_acc *= exp2(scale_s * (m_old - m_new))` when some lanes are all-masked
+3. **Final O normalization** - `O = o_acc / l * scale_o`
+
+---
+
 # Historical Investigation Notes
 
 ## Original Problem Description
@@ -351,393 +417,6 @@ When we modify `quad_output_ps_minor_offset` (which affects the generated tile d
 
 ---
 
-## Investigation: Step 3 - Compare Generated Encodings
-
-### Current (Buggy but Valid) Encoding
-
-With `quad_output_ps_minor_offset = sequence<2, 3, 2>`:
-
-```cpp
-tile_distribution_encoding<
-  sequence<8>,                                           // RsLengths
-  tuple<sequence<2, 2, 2, 8>, sequence<4, 1, 2, 2, 8>>, // HsLengthss
-  tuple<sequence<0, 2>, sequence<1, 2, 1, 2>>,          // ps_to_rhss_major
-  tuple<sequence<0, 1>, sequence<2, 2, 3, 3>>,          // ps_to_rhss_minor ← (2,2,3,3)
-  sequence<2, 1, 1, 2>,                                  // ys_to_rhs_major
-  sequence<0, 0, 1, 4>>                                  // ys_to_rhs_minor
-```
-
-**Key observation:** `ps_to_rhss_minor[1] = sequence<2, 2, 3, 3>`
-
-This comes from the calculation in dst_ps_to_rhss_minor (line ~369):
-- Uses `quad_output_ps_minor_offset = sequence<2, 3, 2>`
-- Combined with other offsets to produce `sequence<2, 2, 3, 3>`
-
-### Fixed (Correct but Invalid) Encoding
-
-With `quad_output_ps_minor_offset = sequence<3, 2, 3>` (after 1↔2 swap):
-
-```cpp
-tile_distribution_encoding<
-  sequence<8>,                                           // RsLengths
-  tuple<sequence<2, 2, 2, 8>, sequence<4, 1, 2, 2, 8>>, // HsLengthss
-  tuple<sequence<0, 2>, sequence<1, 2, 1, 2>>,          // ps_to_rhss_major
-  tuple<sequence<0, 1>, sequence<2, 3, 2, 4>>,          // ps_to_rhss_minor ← (2,3,2,4)
-  sequence<2, 1, 1, 2>,                                  // ys_to_rhs_major
-  sequence<0, 0, 1, 4>>                                  // ys_to_rhs_minor
-```
-
-**Key change:** `ps_to_rhss_minor[1] = sequence<2, 3, 2, 4>` (was `<2, 2, 3, 3>`)
-
-### Comparison
-
-**Difference:**
-- Buggy (valid): `ps_to_rhss_minor[1] = sequence<2, 2, 3, 3>`
-- Fixed (invalid): `ps_to_rhss_minor[1] = sequence<2, 3, 2, 4>`
-
-### Understanding tile_distribution_encoding
-
-Elements in `ps_to_rhss_major` and `ps_to_rhss_minor` form coordinate pairs `(major[i], minor[i])` where:
-- major index: 0=RsLengths, 1=HsLengthss[0], 2=HsLengthss[1]
-- minor index: element position within that sequence
-
-For the fixed encoding `sequence<2, 3, 2, 4>` with major `sequence<1, 2, 1, 2>`:
-- (1, 2) → HsLengthss[0][2] = 2 ✓ Valid index
-- (2, 3) → HsLengthss[1][3] = 2 ✓ Valid index
-- (1, 2) → HsLengthss[0][2] = 2 ✓ Valid index
-- (2, 4) → HsLengthss[1][4] = 8 ✓ Valid index
-
-All indices are valid. However, validation still fails.
-
-### Why Validation Fails
-
-**Validation check #3:** PS→RHS mapping suffix check
-
-The validation computes `shifted_quad_ps_minor0` and checks if it's a suffix of `input_ps_minor_last`.
-
-The failure is NOT about invalid indices, but about the PATTERN `<2, 3, 2, 4>` not being a structural suffix of the expected quad encoding pattern. The validation enforces that the quad pattern must maintain a specific relationship with the overall distribution structure.
-
-This suggests the issue may not be fixable by just modifying `quad_output_ps_minor_offset` calculation - the problem might be in:
-1. The quad encoding definition for ReverseDirection=true
-2. How QuadInput/QuadOutputEncoding are selected
-3. The validation logic itself not accounting for transpose semantics
-
----
-
-## Investigation: Step 4 - Validation Logic Bug
-
-**Finding:** ValidationTraitsImpl uses DIFFERENT QuadEncoding than TransposeTileDistributionTraits
-
-When `ReverseDirection=true`:
-- TransposeTileDistributionTraits (line 215-222): Uses **SWAPPED** encodings
-  - `QuadOutputEncoding = Policy::QuadInputEncoding`
-  - Generates encoding with `quad_output_ps_to_rhss_major0 = sequence<2,1,2>`
-
-- ValidationTraitsImpl (line 119-121): Uses **NON-SWAPPED** encodings
-  - `QuadEncoding = Policy::QuadOutputEncoding`
-  - Validates against `quad_ps_major0 = sequence<1>`
-
-This mismatch means validation checks against the WRONG quad pattern!
-
-**Attempted Fix:** Swap the QuadEncoding selection in ValidationTraitsImpl:
-```cpp
-using QuadEncoding = std::conditional_t<ReverseDirection,
-                                        QuadInputEncoding<LaneGroupSize>,  // Match the swapped
-                                        QuadOutputEncoding<LaneGroupSize>>;
-```
-
-**Result:** ❌ Compiler segfault (infinite recursion in `clang::ASTContext::getTypeInfo`)
-
-This suggests the validation logic change breaks something fundamental, possibly creating circular type dependencies.
-
----
-
-## Partial Fixes Applied (Bypasses)
-
-**Two bugs identified and fixed:**
-1. ✓ Coordinate calculation bug in `quad_output_ps_minor_offset` - HARDCODED FIX APPLIED
-2. ✓ Validation logic bug in `TransposeTileDistrChecker` - BYPASS APPLIED
-
-**Applied fixes:**
-
-### Fix 1: Hardcoded correct encoding (block_fmha_fwd_v3_pipeline_default_policy.hpp:228-248)
-```cpp
-if constexpr(sizeof(typename Problem::VDataType) == 1 &&
-             kNPerBlock == 128 && kKPerBlock == 64) // FP8 with specific size
-{
-    using TransposedDstrEncode = tile_distribution_encoding<
-        sequence<8>,
-        tuple<sequence<2, 2, 2, 8>, sequence<4, 1, 2, 2, 8>>,
-        tuple<sequence<0, 2>, sequence<1, 2, 1, 2>>,
-        tuple<sequence<0, 1>, sequence<2, 3, 2, 4>>,  // FIXED ps_to_rhss_minor
-        sequence<2, 1, 1, 2>,
-        sequence<0, 0, 1, 3>>;  // FIXED ys_to_rhs_minor
-    return make_static_tile_distribution(TransposedDstrEncode{});
-}
-```
-
-### Fix 2: Bypass validation for FP8 (load_tile_transpose.hpp:204)
-```cpp
-static constexpr bool distr_encoding_valid =
-    (sizeof(DataType_) == 1) || Validator::value;
-```
-
-### Fix 3: Skip PS/YS validation for ReverseDirection (load_tile_transpose.hpp:157-171)
-```cpp
-static constexpr bool ps_mapping_valid =
-    ReverseDirection || (/* original checks */);
-static constexpr bool ys_mapping_valid =
-    ReverseDirection || (/* original checks */);
-```
-
-**Current issue:** Compilation still fails for v3 trload variants with template instantiation errors. The hardcoded encoding may not match all v3 configurations.
-
----
-
-## Investigation: Step 5 - How load_tile_transpose() Works
-
-**Goal:** Understand how coordinates are transposed and used at runtime.
-
-### Data Flow
-
-1. **Tile Window Creation** (block_fmha_fwd_v3_pipeline.hpp:735):
-   ```cpp
-   auto v_lds_window = make_tile_window(v_lds, v_lds_window_lengths, v_lds_window_origin, v_block_dstr);
-   ```
-   - `v_lds`: Tensor view of LDS with physical layout **[K1=64, N1=128]**
-   - `v_block_dstr`: Tile distribution created with `TransposedDstrEncode` (ReverseDirection=true)
-
-2. **Coordinate Preparation** (tile_window.hpp:108-149):
-   ```cpp
-   prepare_coords(bottom_tensor_view, window_origin, tile_distribution, partition_index)
-   ```
-   - Uses `tile_distribution.get_ps_ys_to_xs_adaptor()` to map (partition_index, y_coords) → X coordinates
-   - X coordinates are in the space defined by `xs_lengthss` in the tile distribution encoding
-   - Computes `bottom_tensor_thread_coord` for each thread
-   - Result stored in `pre_computed_coords_`
-
-3. **Transpose Load** (tile_window.hpp:680-706):
-   ```cpp
-   const vector_t vec_value =
-       this->get_bottom_tensor_view()
-           .template get_transpose_vectorized_elements<vector_t>(bottom_tensor_thread_coord, offset);
-   ```
-   - Uses `bottom_tensor_thread_coord` to calculate LDS read address
-   - Hardware instruction (ds_read_tr8_b64) reads and transposes data
-   - Stores to register with distribution from `tile_dstr`
-
-4. **Hardware Transpose** (buffer_view.hpp:870-898):
-   ```cpp
-   return amd_transpose_load_to_vgpr<remove_cvref_t<T>, t_per_x>(p_data_ + i + linear_offset);
-   ```
-   - Computes total_offset = coord.get_offset() + linear_offset
-   - Reads from LDS at p_data_[total_offset]
-   - Hardware transposes 8×8 blocks while loading
-
-### The Coordinate Space Problem
-
-**Critical Issue:** Coordinate space mismatch!
-
-- `v_lds` tensor has physical layout **[K1=64, N1=128]** (pre-transpose)
-- `v_block_dstr` has `xs_lengthss = [N1=128, K1=64]` (post-transpose layout from TransposedDstrEncode)
-- `prepare_coords()` uses the adaptor to compute X coordinates in the **xs_lengthss space**
-- So `bottom_tensor_thread_coord` is in **(N1, K1) space**
-- But LDS is still in **(K1, N1) space**!
-
-**This is the fundamental bug:**
-- Coordinates are computed for the OUTPUT (post-transpose) layout [N1, K1]
-- But they're used to index the INPUT (pre-transpose) LDS layout [K1, N1]
-- Result: Wrong LDS addresses (8-lane offset pattern)
-
-### What Should Happen
-
-For `ReverseDirection=true`:
-- Want: V in registers with layout **[N1, K1]**
-- Have: V in LDS with layout **[K1, N1]**
-- `TransposedDstrEncode` should describe how threads map to **INPUT (LDS) space [K1, N1]**
-- NOT how they map to **OUTPUT (register) space [N1, K1]**
-
-But currently, the `xs_lengthss` in `TransposedDstrEncode` is **[N1, K1]** (output space).
-
-### Hypothesis Verification
-
-**Question:** Does `TransposeTileDistributionTraits` swap `xs_lengthss` (HsLengthss) when `ReverseDirection=true`?
-
-**Answer:** YES! Traced through the code:
-
-1. **Input encoding** (v_block_dstr_encode):
-   - HsLengthss: `tuple<sequence<N dims>, sequence<K dims>>`
-   - Describes register layout [N1=128, K1=64]
-
-2. **Transformation** (load_tile_transpose.hpp:257):
-   ```cpp
-   reversed_outer_hs_lengthss = tuple_reverse(outer_hs_lengthss);
-   ```
-   - Swaps the tuple dimensions
-
-3. **Output encoding** (TransposedDstrEncode):
-   - HsLengthss: `tuple<sequence<K dims>, sequence<N dims>>`
-   - Describes LDS layout [K1=64, N1=128]
-   - **This is CORRECT!**
-
-### Revised Understanding
-
-The HsLengthss (dimension sizes) ARE correctly swapped.
-
-But the **ps_to_rhss mappings** (index mappings) are WRONG due to the `quad_output_ps_minor_offset` bug.
-
-When dimensions are swapped:
-- Before: H[0] = N dimension, H[1] = K dimension
-- After: H[0] = K dimension, H[1] = N dimension
-
-The ps_to_rhss indices must point to the correct hidden dimensions after the swap.
-
-The bug in `quad_output_ps_minor_offset` causes wrong indices in `ps_to_rhss_minor`, which makes the adaptor compute wrong coordinates even though HsLengthss is correct.
-
-**Conclusion:** The coordinate fix (swapping indices 1↔2 in quad_output_ps_minor_offset) WAS the right approach. The only problem is that validation rejects it.
-
----
-
-## Investigation: Step 6 - LDS Contents Verification (2025-01-30)
-
-### K LDS Verification
-
-Added debug prints to dump full K LDS contents (64x128) in `block_fmha_fwd_v3_pipeline.hpp`.
-
-**Result:** K LDS contents are **CORRECT**
-
-```
-K_LDS[n= 0]: 7e fe fe fe ...   ← 0x7e at k=0 ✓
-K_LDS[n= 1]: fe 7e fe fe ...   ← 0x7e at k=1 ✓
-K_LDS[n= 2]: fe fe 7e fe ...   ← 0x7e at k=2 ✓
-...
-K_LDS[n= 8]: fe fe fe fe fe fe fe fe 7e fe ...   ← 0x7e at k=8 ✓
-...
-K_LDS[n=16]: ... 7e fe ...   ← 0x7e at k=16 ✓
-...
-K_LDS[n=31]: ... 7e fe ...   ← 0x7e at k=31 ✓
-K_LDS[n=32]: 00 00 00 00 ...   ← zeros (beyond seqlen_k=32) ✓
-```
-
-The diagonal pattern `K[n, n] = 0x7e (10.0)` and `K[n, other] = 0xfe (-10.0)` matches host test pattern.
-
-### V LDS Verification
-
-Previously verified that V LDS contents are also correct.
-
-### Thread Buffer After load_tile() for K
-
-```
-lane8 k_tile thread_buffer:  fe fe fe fe 7e fe fe fe ...  (0x7e at position 4)
-lane16 k_tile thread_buffer: fe fe fe fe fe fe fe fe 7e ... (0x7e at position 8)
-```
-
-### Status Summary
-
-| Component | Status |
-|-----------|--------|
-| K LDS contents | ✓ Correct |
-| V LDS contents | ✓ Correct |
-| K thread buffer after load_tile() | Needs coordinate mapping verification |
-| V thread buffer after load_tile_transpose() | Has 8-lane offset bug |
-| Output (o_acc) | Row 8 has V[16] data, Row 16 is empty |
-
----
-
-## Investigation: Step 7 - Q Tile Lane Mapping Test (2025-01-30)
-
-### Test Setup
-
-Modified Q initialization to test lane-to-row mapping:
-- Q row 8: all 2.0 → quantized to 0x79 (288.0 in FP8)
-- Q row 16: all 3.0 → quantized to 0x7e (448.0 in FP8)
-- All other rows: zeros
-
-### Results
-
-**Host quantized Q values:**
-```
-q_quant[row=0, :16] bytes: ['00', '00', ...] (zeros)
-q_quant[row=8, :16] bytes: ['79', '79', ...] (288.0 in FP8)
-q_quant[row=16, :16] bytes: ['7e', '7e', ...] (448.0 in FP8)
-```
-
-**Device q_tile thread buffer:**
-```
-lane8:  79 79 79 79 ...  ← Row 8 data ✓
-lane16: 7e 7e 7e 7e ...  ← Row 16 data ✓
-```
-
-**Conclusion:** Q loading with `load_tile()` has CORRECT lane-to-row mapping.
-
-### Updated Status Summary
-
-| Component | Status | Notes |
-|-----------|--------|-------|
-| Q tile loading (`load_tile()`) | ✓ Correct | Lane 8 → Row 8, Lane 16 → Row 16 |
-| K LDS contents | ✓ Correct | Diagonal pattern matches host |
-| V LDS contents | ✓ Correct | Previously verified |
-| sp_compute (QK GEMM output) | ✗ **Row-swapped** | Bug occurs BEFORE PV GEMM |
-| o_acc (final output) | ✗ Row-swapped | Same issue as sp_compute |
-
-### Key Finding
-
-**The bug occurs BEFORE PV GEMM** - the `sp_compute` (softmax output from QK GEMM) already has the row-swapped issue.
-
-This means the bug is NOT in:
-- V loading (`load_tile_transpose()`)
-- PV GEMM
-
-The bug must be in one of:
-1. K loading (`load_tile()`) - lane-to-row mapping might be wrong
-2. QK GEMM computation itself
-3. How Q and K tiles are used in gemm_0
-
----
-
-## Investigation: Q Tile Lane-to-Column Mapping (2024-01-30)
-
-### Test Pattern
-
-Filled Q rows with alternating values every 16 elements:
-```python
-# Q[row, 0:16] = row_base, Q[row, 16:32] = row_base+0.1, etc.
-for i in range(seqlen_q):
-    row_base = (i + 1) * 1.0
-    for chunk in range(d // 16):
-        q[:, i, :, chunk*16:(chunk+1)*16] = row_base + chunk * 0.1
-```
-
-### Host Q Row 0 (128 columns, 8 chunks of 16):
-
-| Chunk | Columns | Value | FP8 hex |
-|-------|---------|-------|---------|
-| 0 | 0-15 | 1.0 | 0x56 |
-| 1 | 16-31 | 1.1 | 0x57 |
-| 2 | 32-47 | 1.2 | 0x58 |
-| 3 | 48-63 | 1.3 | 0x59 |
-| 4 | 64-79 | 1.4 | 0x5a |
-| 5 | 80-95 | 1.5 | 0x5a |
-| 6 | 96-111 | 1.6 | 0x5b |
-| 7 | 112-127 | 1.7 | 0x5c |
-
-### Kernel Lane Q Tile Thread Buffer:
-
-| Lane | Buffer positions 0-15 | Buffer positions 16-31 | Buffer positions 32-47 | Buffer positions 48-63 |
-|------|----------------------|------------------------|------------------------|------------------------|
-| Lane 0 | 0x56 (chunk 0) | 0x58 (chunk 2) | 0x5a (chunk 4) | 0x5b (chunk 6) |
-| Lane 32 | 0x57 (chunk 1) | 0x59 (chunk 3) | 0x5a (chunk 5) | 0x5c (chunk 7) |
-
-### Conclusion: Interleaved Chunk Pattern
-
-**Lane N and Lane N+32 together form row N's complete Q data:**
-- Lane N has **even chunks** (0, 2, 4, 6) → columns 0-15, 32-47, 64-79, 96-111
-- Lane N+32 has **odd chunks** (1, 3, 5, 7) → columns 16-31, 48-63, 80-95, 112-127
-
-This is the correct MFMA layout for register tile distribution - Q loading is working correctly!
-
----
-
 ## Investigation: K Tile Half-Stride Bug (2024-01-30)
 
 ### Test Pattern
@@ -870,6 +549,8 @@ Output max diff: 0.035
 |-----------|-----------|
 | v3 Pipeline Policy | `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_fwd_v3_pipeline_default_policy.hpp` |
 | v3 Pipeline | `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_fwd_v3_pipeline.hpp` |
+| v3 Kernel | `3rdparty/composable_kernel/include/ck_tile/ops/fmha/kernel/fmha_fwd_v3_kernel.hpp` |
+| Masking | `3rdparty/composable_kernel/include/ck_tile/ops/fmha/block/block_masking.hpp` |
 | async_trload Policy | `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs_async_trload_policy.hpp` |
 | Transpose Load | `3rdparty/composable_kernel/include/ck_tile/core/tensor/load_tile_transpose.hpp` |
 | Warp GEMM Dispatcher | `3rdparty/composable_kernel/include/ck_tile/ops/gemm/warp/warp_gemm_dispatcher.hpp` |

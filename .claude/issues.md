@@ -5,7 +5,7 @@
 | ID | Issue | Status | Affects | Root Cause |
 |----|-------|--------|---------|------------|
 | #1 | [K Tile Half-Stride Bug](#issue-1-k-tile-half-stride-bug) | ✓ FIXED | All FP8, all seqlen | SwizzleB warp GEMM half-stride |
-| #2 | [Causal + Large Seqlen Bug](#issue-2-causal--large-seqlen-bug) | 🔴 OPEN | causal=True, seqlen≥256 | Unknown |
+| #2 | [Causal + Large Seqlen Bug](#issue-2-causal--large-seqlen-bug) | 🔴 OPEN | causal=True, seqlen≥256 | Unknown (investigating) |
 | #3 | [V Tile Transpose Load Bug](#issue-3-v-tile-transpose-load-bug) | ⚠️ BYPASSED | FP8 V tile loading | Coordinate mismatch |
 
 > **Note:** Replace `<CONTAINER>` and `<WORKSPACE>` with values from `.claude/user.md`
@@ -14,7 +14,7 @@
 
 ## Issue #1: K Tile Half-Stride Bug
 
-### Status: ✓ FIXED (2025-01-30)
+### Status: ✓ FIXED (2026-01-30)
 
 ### Description
 Lane N receives K row N/2 instead of row N during K tile loading, causing 8-lane offset in output.
@@ -54,24 +54,59 @@ docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && pytho
 
 ## Issue #2: Causal + Large Seqlen Bug
 
-### Status: 🔴 OPEN
+### Status: 🔴 OPEN (Root cause unknown)
 
 ### Description
 Tests fail when **causal=True** AND **seqlen ≥ 256**. All other combinations pass.
 
-### Root Cause
-Unknown. Under investigation.
+### Current Test Result (2026-02-02)
+
+```bash
+python op_tests/test_mha_fp8.py -b 1 -n 1 -q 256 -k 64 -d 128 -dv 128 -c
+```
+
+**Output:**
+```
+Output max diff (kernel vs bf16 ref): 0.287109375
+Output max diff (kernel vs online ref): 0.271484375
+Output max diff (bf16 ref vs online ref): 0.03515625
+```
+
+The two references agree with each other (diff=0.035), but kernel differs from both by ~0.27-0.29.
+
+### Ruled Out (Verified Correct)
+
+1. **scale_p = 448** (CORRECT)
+   - Verified via debug print: `[SCALE_DEBUG] scale_p=448.0000`
+   - Hardware path `type_convert<float>` correctly returns 448.0
+
+2. **Causal mask formula** (CORRECT)
+   - Kernel mask matches reference formula
+   - Verified via debug prints showing correct `should_mask` values
+
+3. **m (row max) and l (row sum)** - verified correct via debug prints
+
+### Remaining Hypotheses
+
+1. **P×V GEMM computation** (HIGH)
+   - P values appear correct, V loading appears correct
+   - But o_acc output differs from reference
+   - May be issue in GEMM1 data layout or accumulation
+
+2. **Online softmax rescaling** (MEDIUM)
+   - The `o_acc *= exp2(scale_s * (m_old - m_new))` rescaling
+   - May have issue when some lanes have all-masked P values
 
 ### Reproduction
 ```bash
 # Fails
-docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 8 -q 256 -k 256 -d 128 -dv 128 -c"
+docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 1 -q 256 -k 64 -d 128 -dv 128 -c"
 
 # Passes (same config, no causal)
-docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 8 -q 256 -k 256 -d 128 -dv 128"
+docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 1 -q 256 -k 64 -d 128 -dv 128"
 ```
 
-### Test Results (2025-01-31)
+### Test Results (2026-01-31)
 
 Full pytest run with Issue #1 fix applied:
 
@@ -84,7 +119,6 @@ Full pytest run with Issue #1 fix applied:
 | 256 | ✓ PASS | ❌ FAIL |
 | 512 | ✓ PASS | ❌ FAIL |
 | 1023 | ✓ PASS | ❌ FAIL |
-| 1024 | ✓ PASS | ❌ FAIL |
 | 2048 | ✓ PASS | ❌ FAIL |
 | 4096 | ✓ PASS | ❌ FAIL |
 
@@ -131,6 +165,9 @@ This issue was initially investigated as the root cause of the 8-lane offset bug
 ## Test Commands Reference
 
 ```bash
+# Full pytest suite (source of truth)
+python -m pytest op_tests/test_mha_fp8.py -v
+
 # Clean JIT cache (required before each test)
 rm -f aiter/jit/*.so
 
@@ -140,12 +177,11 @@ python op_tests/test_mha_fp8.py -b 1 -n 1 -q 32 -k 32 -d 128 -dv 128
 # With causal mask
 python op_tests/test_mha_fp8.py -b 1 -n 1 -q 32 -k 32 -d 128 -dv 128 -c
 
-# Full pytest suite
-python -m pytest op_tests/test_mha_fp8.py -v --tb=short
-
 # Specific test pattern
 python -m pytest op_tests/test_mha_fp8.py -v -k "256" --tb=short
 ```
+
+**IMPORTANT:** Always run `pytest op_tests/test_mha_fp8.py` to verify any fix before documenting conclusions.
 
 ---
 
@@ -155,6 +191,6 @@ python -m pytest op_tests/test_mha_fp8.py -v -k "256" --tb=short
 |-----------|------|
 | v3 Pipeline Policy | `3rdparty/composable_kernel/.../block_fmha_fwd_v3_pipeline_default_policy.hpp` |
 | v3 Pipeline | `3rdparty/composable_kernel/.../block_fmha_fwd_v3_pipeline.hpp` |
-| Transpose Load | `3rdparty/composable_kernel/.../load_tile_transpose.hpp` |
+| v3 Kernel | `3rdparty/composable_kernel/.../fmha_fwd_v3_kernel.hpp` |
+| Masking | `3rdparty/composable_kernel/.../block_masking.hpp` |
 | Test | `op_tests/test_mha_fp8.py` |
-| Debug Test (backup) | `op_tests/test_mha_fp8.py.bak` |

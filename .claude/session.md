@@ -1,6 +1,6 @@
 # FP8 FMHA v3 Debug Session
 
-**Last Updated:** 2025-01-31
+**Last Updated:** 2026-02-02 (pytest verified: 48 failed, 128 passed)
 
 ## Current Focus
 
@@ -8,150 +8,142 @@ Investigating **Issue #2: Causal + Large Seqlen Bug** - tests fail when causal=T
 
 See [issues.md](issues.md) for full issue tracking and test results.
 
-### Debug Session (2025-02-02)
+---
 
-#### Minimal Reproduction Case
+## Verified Correct (Ruled Out)
 
-**Test command:**
+1. **scale_p = 448** (CORRECT)
+   - Verified via debug print: `[SCALE_DEBUG] scale_p=448.0000`
+   - Hardware path `type_convert<float>` correctly returns 448.0
+   - The `(float)numeric<fp8_t>::max()` returning 126.0 only affects debug prints, not actual computation
+
+2. **Causal mask formula** (CORRECT)
+   - Kernel uses: `x_end = i_y + x` where `x = 1 + right_size + x_tmp`
+   - For causal with `window_size[1] = 0`: valid if `col <= row + seqlen_k - seqlen_q`
+   - Reference uses: `mask = col > row + seqlen_k - seqlen_q + window_size[1]` with `window_size[1] = 0`
+   - Both formulas are equivalent - kernel mask is correct
+
+3. **m (row max) and l (row sum)** verified via debug prints
+
+---
+
+## Current Test Result
+
 ```bash
-docker exec poyenc-ck bash -c "cd /root/workspace/worktree/aiter-main && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 1 -q 256 -k 256 -d 128 -dv 128 -c"
+python op_tests/test_mha_fp8.py -b 1 -n 1 -q 256 -k 64 -d 128 -dv 128 -c
 ```
 
-**Configuration (1 thread block):**
-| Parameter | Value | Reason |
-|-----------|-------|--------|
-| batch | 1 | Single batch |
-| nheads | 1 | Single head |
-| seqlen_q | 256 | = kM0 (Q tile size), so 1 Q tile |
-| seqlen_k | 256 | 4 K/V tile iterations (256/kN0=64 = 4) |
-| hdim | 128 | = kN1 (V tile size), so 1 hdim tile |
-| causal | True | Required to trigger bug |
+**Output:**
+```
+Output max diff (kernel vs bf16 ref): 0.287109375
+Output max diff (kernel vs online ref): 0.271484375
+Output max diff (bf16 ref vs online ref): 0.03515625
+```
 
-**Grid size:** `dim3(1, 1, 1)` = exactly 1 thread block
+The two references (bf16 ref and online ref) agree with each other (diff=0.035), but kernel differs from both by ~0.27-0.29.
 
-**Tile sizes (from fmha_fwd.py for FP8BF16 v3):**
-- kM0 = 256 (Q tile along seqlen_q)
-- kN0 = 64 (K tile along seqlen_k)
-- kN1 = 128 (V tile along hdim_v)
+---
 
-#### Reference Implementation
+## Warp/Row Mapping (FP8 v3 Pipeline)
 
-**File:** `op_tests/test_mha_fp8.py` - `attention_fp8_ref_online()`
+**Configuration:** 8 warps, M0=256, 32x32 MFMA
 
-Simulates kernel's online softmax with KV tile size = 64:
-1. Loop over K/V tiles (4 iterations for seqlen_k=256)
-2. For each tile:
-   - Compute S = Q @ K_tile^T (fp8 x fp8 -> fp32)
-   - Apply causal mask (set masked positions to -inf)
-   - Online softmax update:
-     - m_new = max(m_old, rowmax(S))
-     - alpha = exp2(scale_s * (m_old - m_new))
-     - P = exp2(scale_s * (S - m_new))
-     - l = alpha * l + sum(P)
-     - o_acc = alpha * o_acc + P_fp8 @ V_tile
-3. Final: O = o_acc / l * scale_o
+| Warp | Q Rows | Output Rows |
+|------|--------|-------------|
+| 0 | [0, 32) | [0, 32) |
+| 1 | [32, 64) | [32, 64) |
+| 2 | [64, 96) | [64, 96) |
+| 3 | [96, 128) | [96, 128) |
+| 4 | [128, 160) | [128, 160) |
+| 5 | [160, 192) | [160, 192) |
+| 6 | [192, 224) | [192, 224) |
+| 7 | [224, 256) | [224, 256) |
 
-**Verified correct in kernel:**
-- Row-max `m` values match reference
-- Row-sum `l` values match reference (7.0208 for row 7)
-- Masking correctly sets P=0 for tiles 1-3 (kv >= 64 for row 7)
+**Lane mapping within warp (64 threads/wavefront):** Both lane N and lane N+32 own row N within the 32-row chunk (for transposed C distribution with 32x32 MFMA).
 
-**Still investigating:**
-- o_acc values are WRONG before final normalization
-- Kernel o_acc[7,:8] = [0.5772, 0.4867, 0.6153, 0.4604, ...]
-- Reference output[7,:8] = [0.5586, 0.4414, 0.5508, 0.4551, ...]
-- Bug is in P*V GEMM or o_acc accumulation
+**Column distribution for row 196 (warp 6):**
+- Lane 4 handles: cols 0,1,2,3,8,9,10,11,16,17,...
+- Lane 36 handles: cols 4,5,6,7,12,13,14,15,20,21,...
+
+**KV tile iterations:** For seqlen_k=256 with kN0=64:
+- Tile 0: K[0:64]
+- Tile 1: K[64:128]
+- Tile 2: K[128:192]
+- Tile 3: K[192:256]
+
+**Causal mask (bottom-right alignment):**
+```python
+# Mask condition from attention_fp8_ref() with causal=True:
+# window_size becomes (-1, 0), so window_size[1] = 0
+mask = col_idx > row_idx + seqlen_k - seqlen_q + 0
+```
+
+Example with seqlen_q=256, seqlen_k=64:
+- Rows 0-191: full attention (all K[0:64] valid)
+- Row 192: K[0:1] valid (1 position)
+- Row 196: K[0:5] valid (5 positions: cols 0,1,2,3,4)
+- Row 255: K[0:64] valid (all 64 positions)
 
 ---
 
 ## Progress
 
+### 2026-02-02
+
+1. **Verified scale_p = 448** (CORRECT)
+   - Debug print confirmed `scale_p=448.0000`
+   - Ruled out FP8 max value interpretation issue
+
+2. **Verified kernel mask is correct**
+   - Lane 4: cols 0-3 have `should_mask=0`
+   - Lane 36: col 4 has `should_mask=0`, cols 5+ have `should_mask=1`
+   - Matches reference formula
+
+3. **Removed all debug prints** from kernel code
+
+4. **Confirmed test failure**
+   - `test_mha_fp8.py -b 1 -n 1 -q 256 -k 64 -d 128 -dv 128 -c` fails
+   - kernel vs reference diff: 0.27-0.29
+   - References agree with each other (diff=0.035)
+
 ### 2025-01-31
 
 1. **Fixed Issue #1 (K Tile Half-Stride Bug)**
    - Changed `GetQKBlockGemm()` to use non-SwizzleB warp GEMM
-   - Verified fix is equivalent to async_trload policy for FP8/FP16/BF16
    - Small seqlen tests now pass (32, 108, 113, 128)
 
 2. **Discovered Issue #2 (Causal + Large Seqlen Bug)**
-   - Ran full pytest suite: 48 failed, 128 passed
-   - All failures are causal=True + seqlen≥256
-   - All causal=False tests pass regardless of seqlen
-   - All small seqlen tests pass regardless of causal
-
-3. **Documented findings**
-   - Created `.claude/issues.md` for issue tracking
-   - Created `.claude/findings.md` for investigation details
-   - Updated CLAUDE.md with workflow instructions
-
-### 2025-01-30
-
-1. Investigated 8-lane offset bug (V[16] data in output row 8)
-2. Traced through V tile transpose load - found `quad_output_ps_minor_offset` mismatch
-3. 9 fix attempts all failed validation
-4. Pivoted to investigate K tile loading
-5. Found K tile half-stride bug (lane N gets row N/2)
-6. Applied fix to GetQKBlockGemm()
+   - 48 failed, 128 passed
+   - All failures: causal=True + seqlen≥256
 
 ---
 
 ## Hypothesis
 
-For Issue #2 (causal + large seqlen), the bug likely involves:
+For Issue #2 (causal + large seqlen), remaining possibilities:
 
-1. **Multi-tile iteration** (HIGH)
-   - seqlen=256 requires 4 tile iterations (tile size = 64)
-   - Bug may be in K/V tile loop when seqlen > tile size
+1. **P×V GEMM computation** (HIGH)
+   - The P values are correct, V loading appears correct
+   - But o_acc output differs from reference
+   - May be issue in GEMM1 (P×V) data layout or accumulation
 
-2. **Causal mask at tile boundaries** (HIGH)
-   - Mask calculation may be wrong when attention spans multiple tiles
-   - First tile iteration vs subsequent may differ
+2. **Online softmax rescaling** (MEDIUM)
+   - The `o_acc *= exp2(scale_s * (m_old - m_new))` rescaling
+   - May have issue when some lanes have all-masked P values
 
-3. **Online softmax state management** (MEDIUM)
-   - `m` (max) and `l` (sum) accumulators updated across tiles
-   - Rescaling factor may be computed incorrectly
-
-4. **V tile transpose load** (LOW)
-   - Issue #3 is bypassed, not fixed
-   - May have runtime effects in multi-tile scenarios
+3. ~~FP8 scale_p mismatch~~ (RULED OUT - scale_p = 448 is correct)
+4. ~~Causal mask off-by-one~~ (RULED OUT - kernel mask is correct)
 
 ---
 
 ## TODO
 
-- [ ] Debug seqlen=256, causal=True case
-  - [ ] Add debug prints for tile iteration index
-  - [ ] Print attention scores (S) for each tile
-  - [ ] Print softmax output (P) for each tile
-  - [ ] Print output accumulator (O) after each tile
-
-- [ ] Check causal mask logic
-  - [ ] Verify mask coordinates for tile boundaries
-  - [ ] Compare v3 vs async_trload mask handling
-
-- [ ] Check online softmax
-  - [ ] Print m/l values across tile iterations
-  - [ ] Verify rescaling factor calculation
-
-- [ ] Compare pipelines
-  - [ ] Run same config with async_trload (if possible)
-  - [ ] Diff the pipeline implementations
-
----
-
-## Next Steps
-
-1. **Immediate:** Add debug prints to v3 pipeline for seqlen=256, causal=True
-   - File: `block_fmha_fwd_v3_pipeline.hpp`
-   - Print tile iteration index, S, P, O values for specific lanes
-
-2. **Short-term:** Identify which tile iteration introduces the error
-   - First tile vs subsequent tiles
-   - Tile boundary vs tile interior
-
-3. **Investigation:** Compare causal mask handling
-   - v3: `block_fmha_fwd_v3_pipeline.hpp`
-   - async_trload: `block_fmha_pipeline_qr_ks_vs_async.hpp`
+- [x] Verify scale_p value at runtime → 448 (correct)
+- [x] Verify mask formula matches reference → correct
+- [x] Remove debug prints from kernel
+- [ ] Trace GEMM1 (P×V) output for specific lanes
+- [ ] Compare o_acc values before/after rescaling with reference
+- [ ] Check if issue is in final O normalization (O = o_acc / l * scale_o)
 
 ---
 
@@ -162,16 +154,25 @@ For Issue #2 (causal + large seqlen), the bug likely involves:
 > Replace `<CONTAINER>` and `<WORKSPACE>` with values from `.claude/user.md`
 
 ```bash
-# Failing test (Issue #2)
-docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 8 -q 256 -k 256 -d 128 -dv 128 -c"
+# Full pytest suite (source of truth for pass/fail)
+docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python -m pytest op_tests/test_mha_fp8.py -v"
+
+# Single failing test (Issue #2) - single KV tile
+docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 1 -q 256 -k 64 -d 128 -dv 128 -c"
+
+# Single failing test (Issue #2) - multiple KV tiles
+docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 1 -q 256 -k 256 -d 128 -dv 128 -c"
 
 # Passing test (same config, no causal)
-docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 8 -q 256 -k 256 -d 128 -dv 128"
+docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 1 -q 256 -k 64 -d 128 -dv 128"
 ```
 
+**IMPORTANT:** Always run `pytest op_tests/test_mha_fp8.py` to verify any fix before documenting conclusions.
+
 ### Key Files
+- v3 Kernel: `3rdparty/composable_kernel/.../fmha_fwd_v3_kernel.hpp`
 - v3 Pipeline: `3rdparty/composable_kernel/.../block_fmha_fwd_v3_pipeline.hpp`
-- v3 Policy: `3rdparty/composable_kernel/.../block_fmha_fwd_v3_pipeline_default_policy.hpp`
+- Masking: `3rdparty/composable_kernel/.../block_masking.hpp`
 - Test: `op_tests/test_mha_fp8.py`
 
 ### Related Docs
