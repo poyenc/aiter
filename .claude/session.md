@@ -249,3 +249,9 @@ If you accidentally revert these, the tests will pass because they fall back to 
 ```
 
 Only enable debug prints (`#if 1`) when you specifically need to see the output. After debugging, disable them again before running the full test suite.
+
+---
+
+## WARNING: Do Not Modify test_mha_fp8.py
+
+**Never modify `op_tests/test_mha_fp8.py` to avoid inaccurate testing results.** If you need to add code to check outputs or debug values, write a separate script instead (e.g., `op_tests/debug_mha_fp8.py`).
