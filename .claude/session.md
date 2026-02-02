@@ -219,17 +219,27 @@ For Issue #2 (causal + large seqlen), remaining possibilities:
 
 ---
 
-## Case 3 Results: IsMasking=true with padding-only predicate
+## Case 3 & 4: Isolating the masking bug
 
-Modified IsMasking=true path to only check `col >= seqlen_k_end`:
+v3 uses `GenericAttentionMask` from `block_masking.hpp`.
 
-| Row | kernel (causal=True) | nocausal | diff |
-|-----|---------------------|----------|------|
-| 0 | 0.4180 | 0.4395 | 0.023 |
-| 8 | 0.4121 | 0.4395 | 0.035 |
-| 31 | 0.4180 | 0.4434 | 0.031 |
+### Case 3: Modify predicate in pipeline only
 
-**Finding:** Outputs still differ by 0.02-0.04 per row even with same masking predicate. Bug is NOT just in the predicate - there's other IsMasking-dependent code.
+Modified `set_tile_if` predicate for IsMasking=true to use `col >= seqlen_k_end`:
+
+| Test | Result |
+|------|--------|
+| kernel causal=True vs causal=False | **0.051** (NOT identical) |
+
+### Case 4: Modify IsOutOfBound() in GenericAttentionMask
+
+Modified `IsOutOfBound()` for IsMasking=true to use `return i_x >= x_total`:
+
+| Test | Result |
+|------|--------|
+| kernel causal=True vs causal=False | **0.0** (IDENTICAL) |
+
+**Conclusion:** The difference between Case 3 and Case 4 shows the bug is in other code that uses `mask.IsOutOfBound()` or `IsEdgeTile()`, not just the predicate in `set_tile_if`. The `IsEdgeTile()` function also has IsMasking-dependent logic that affects `need_perpixel_check`.
 
 ---
 
