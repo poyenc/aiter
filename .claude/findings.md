@@ -92,11 +92,16 @@ Both use `MNK` - no difference for GEMM0.
 
 **Potential impact:** Different loop order affects how partial products accumulate. For P×V with causal masking where some P rows are partially or fully zeroed, the accumulation order may produce different intermediate rounding behavior.
 
-**Next step:** Try changing v3 GEMM1 to use `GemmLoopOrder::KMN` and test if this fixes the causal + large seqlen bug.
+**Tested (2026-02-02):** Changed v3 GEMM1 to use `GemmLoopOrder::KMN` with matching P and V distributions:
+- Updated `MakePRegTileDistribution()` to use explicit distribution with `sequence<2, 1>`
+- Updated `MakeVRegTileDistribution()` to use `sequence<2, 1>`
+- Changed `GetPVBlockGemm()` to use `GemmLoopOrder::KMN`
+
+**Result:** Test still fails with same diff (0.287109375). **GemmLoopOrder is NOT the root cause.**
 
 ### Remaining Investigation Areas
 
-1. **GemmLoopOrder mismatch** (NEW) - v3 uses `MNK`, async_trload uses `KMN` for GEMM1
+1. ~~GemmLoopOrder mismatch~~ (RULED OUT) - Tested KMN, same failure
 2. **P×V GEMM (gemm_1)** - P values appear correct, but o_acc differs from reference
 3. **Online softmax rescaling** - `o_acc *= exp2(scale_s * (m_old - m_new))` when some lanes are all-masked
 4. **Final O normalization** - `O = o_acc / l * scale_o`

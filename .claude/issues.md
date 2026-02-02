@@ -86,6 +86,11 @@ The two references agree with each other (diff=0.035), but kernel differs from b
 
 3. **m (row max) and l (row sum)** - verified correct via debug prints
 
+4. **GemmLoopOrder mismatch** (RULED OUT)
+   - v3 uses `MNK` for GEMM1, async_trload uses `KMN`
+   - Tested: Changed to KMN with matching P+V distributions
+   - Result: Test still fails with same diff (0.287)
+
 ### Remaining Hypotheses
 
 1. **P×V GEMM computation** (HIGH)
