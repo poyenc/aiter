@@ -29,6 +29,7 @@ See [issues.md](issues.md) for full issue tracking and test results.
 
 ## Current Test Result
 
+### Large Seqlen Case
 ```bash
 python op_tests/test_mha_fp8.py -b 1 -n 1 -q 256 -k 64 -d 128 -dv 128 -c
 ```
@@ -40,7 +41,42 @@ Output max diff (kernel vs online ref): 0.271484375
 Output max diff (bf16 ref vs online ref): 0.03515625
 ```
 
-The two references (bf16 ref and online ref) agree with each other (diff=0.035), but kernel differs from both by ~0.27-0.29.
+### Small Seqlen Case (Smallest Reproduction)
+```bash
+python op_tests/debug_mha_fp8.py -b 1 -n 1 -q 32 -k 32 -d 128 -dv 128 -c
+```
+
+**Output:**
+```
+Output max diff (kernel vs bf16 ref): 0.27734375
+Output max diff (kernel vs online ref): 0.28125
+Output max diff (kernel vs batch ref): 0.28125
+Output max diff (online ref vs batch ref): 0.0
+```
+
+**Key Finding:** The online and batch references produce identical output (diff=0.0), confirming the bug is in the kernel, not the reference implementations.
+
+### Non-Causal Case (PASSES)
+```bash
+python op_tests/debug_mha_fp8.py -b 1 -n 1 -q 32 -k 32 -d 128 -dv 128
+```
+
+**Output:**
+```
+Output max diff (kernel vs bf16 ref): 0.03125  # < 0.055 threshold
+Output max diff (kernel vs online ref): 0.02734375
+Output max diff (kernel vs batch ref): 0.02734375
+```
+
+**Conclusion:** Bug is specific to causal masking. Non-causal case passes.
+
+Error distribution by row (for seqlen_q=32, seqlen_k=32, causal=True):
+- Row 0: diff=0.027 (attends to 1 col)
+- Row 7: diff=0.074 (attends to 8 cols) - **highest error**
+- Row 15: diff=0.006 (attends to 16 cols)
+- Row 16: diff=0.020 (attends to 17 cols)
+- Row 24: diff=0.057 (attends to 25 cols)
+- Row 31: diff=0.010 (attends to 32 cols)
 
 ---
 
@@ -149,20 +185,16 @@ Both use `GemmLoopOrder::MNK` - **no difference**.
 For Issue #2 (causal + large seqlen), remaining possibilities:
 
 1. ~~GemmLoopOrder mismatch~~ (RULED OUT)
-   - v3 uses `MNK` for GEMM1, async_trload uses `KMN`
-   - **Tested:** Changed to KMN with matching P+V distributions, test still fails with same diff 0.287
-
-2. **P×V GEMM computation** (HIGH)
-   - The P values are correct, V loading appears correct
-   - But o_acc output differs from reference
-   - May be issue in GEMM1 (P×V) data layout or accumulation
-
-3. **Online softmax rescaling** (MEDIUM)
-   - The `o_acc *= exp2(scale_s * (m_old - m_new))` rescaling
-   - May have issue when some lanes have all-masked P values
-
+2. ~~P×V GEMM computation~~ (RULED OUT - works when mask disabled)
+3. ~~Online softmax rescaling~~ (RULED OUT - works when mask disabled)
 4. ~~FP8 scale_p mismatch~~ (RULED OUT - scale_p = 448 is correct)
-5. ~~Causal mask off-by-one~~ (RULED OUT - kernel mask is correct)
+5. ~~Causal mask off-by-one~~ (RULED OUT - kernel mask decisions are correct)
+
+6. **`set_tile_if` tile index mapping** (HIGH - CURRENT FOCUS)
+   - When masking is disabled (`#if 0`), causal=True and causal=False produce **identical** output (diff=0.0)
+   - When masking is enabled, causal=True fails with diff=0.28
+   - The mask predicate returns correct values (row 8 correctly masks cols 9+)
+   - **Suspicion:** `set_tile_if` may incorrectly map distributed indices to global (row, col) for v3's sp_compute distribution
 
 ---
 
