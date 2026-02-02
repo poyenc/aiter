@@ -220,3 +220,15 @@ docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && pytho
 ## Notice
 
 If encounter error 3 times and cannot make progress, ask user for help and let user decide what to do next.
+
+---
+
+## WARNING: Git Checkout
+
+**ALWAYS ask user before running `git checkout` on files in the CK submodule.**
+
+Reverting certain files can disable v3 kernel dispatch, causing tests to run v2 kernels instead and give **false-positive** results. Critical files that control v3 dispatch:
+- `example/ck_tile/01_fmha/codegen/ops/fmha_fwd.py` - Controls which kernels are generated
+- `include/ck_tile/ops/fmha/kernel/fmha_fwd_v3_kernel.hpp` - v3 kernel implementation
+
+If you accidentally revert these, the tests will pass because they fall back to v2 kernels.
