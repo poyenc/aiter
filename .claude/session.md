@@ -207,6 +207,32 @@ For Issue #2 (causal + large seqlen), remaining possibilities:
 
 ---
 
+## Next Steps
+
+1. **Investigate why causal=True and causal=False produce different output even with same masking predicate**
+   - `IsEdgeTile()` has different logic for IsMasking=true vs false
+   - `l == 0 ? 0 : 1/l` vs `1/l` at final normalization (line 1517)
+   - `CoreLoopScheduler` has different specializations (scheduling only, shouldn't affect correctness)
+
+2. **Verify sp_compute tile distribution is correct for set_tile_if:**
+   - Check if `get_x_indices_from_distributed_indices` returns correct (row, col)
+
+---
+
+## Case 3 Results: IsMasking=true with padding-only predicate
+
+Modified IsMasking=true path to only check `col >= seqlen_k_end`:
+
+| Row | kernel (causal=True) | nocausal | diff |
+|-----|---------------------|----------|------|
+| 0 | 0.4180 | 0.4395 | 0.023 |
+| 8 | 0.4121 | 0.4395 | 0.035 |
+| 31 | 0.4180 | 0.4434 | 0.031 |
+
+**Finding:** Outputs still differ by 0.02-0.04 per row even with same masking predicate. Bug is NOT just in the predicate - there's other IsMasking-dependent code.
+
+---
+
 ## TODO
 
 - [x] Verify scale_p value at runtime → 448 (correct)
@@ -214,9 +240,10 @@ For Issue #2 (causal + large seqlen), remaining possibilities:
 - [x] Compare GEMM config between v3 and async_trload
 - [x] Try changing v3 GEMM1 GemmLoopOrder from MNK to KMN → NOT THE BUG
 - [x] Confirm `set_tile_if` works for IsMasking=false path
-- [ ] **Investigate why IsMasking=true path produces wrong results**
-- [ ] Compare with async_trload's masking implementation
-- [ ] Print FULL intermediate values (32+ elements, not just 4-8) when debugging
+- [x] Modify IsMasking=true path to only check padding → still differs by 0.02-0.04
+- [ ] **Investigate `IsEdgeTile()` differences between IsMasking=true/false**
+- [ ] **Check final normalization `l == 0 ? 0 : 1/l` path**
+- [ ] Print FULL intermediate values (32+ elements) when debugging
 
 ---
 
