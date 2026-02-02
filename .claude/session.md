@@ -8,6 +8,60 @@ Investigating **Issue #2: Causal + Large Seqlen Bug** - tests fail when causal=T
 
 See [issues.md](issues.md) for full issue tracking and test results.
 
+### Debug Session (2025-02-02)
+
+#### Minimal Reproduction Case
+
+**Test command:**
+```bash
+docker exec poyenc-ck bash -c "cd /root/workspace/worktree/aiter-main && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 1 -q 256 -k 256 -d 128 -dv 128 -c"
+```
+
+**Configuration (1 thread block):**
+| Parameter | Value | Reason |
+|-----------|-------|--------|
+| batch | 1 | Single batch |
+| nheads | 1 | Single head |
+| seqlen_q | 256 | = kM0 (Q tile size), so 1 Q tile |
+| seqlen_k | 256 | 4 K/V tile iterations (256/kN0=64 = 4) |
+| hdim | 128 | = kN1 (V tile size), so 1 hdim tile |
+| causal | True | Required to trigger bug |
+
+**Grid size:** `dim3(1, 1, 1)` = exactly 1 thread block
+
+**Tile sizes (from fmha_fwd.py for FP8BF16 v3):**
+- kM0 = 256 (Q tile along seqlen_q)
+- kN0 = 64 (K tile along seqlen_k)
+- kN1 = 128 (V tile along hdim_v)
+
+#### Reference Implementation
+
+**File:** `op_tests/test_mha_fp8.py` - `attention_fp8_ref_online()`
+
+Simulates kernel's online softmax with KV tile size = 64:
+1. Loop over K/V tiles (4 iterations for seqlen_k=256)
+2. For each tile:
+   - Compute S = Q @ K_tile^T (fp8 x fp8 -> fp32)
+   - Apply causal mask (set masked positions to -inf)
+   - Online softmax update:
+     - m_new = max(m_old, rowmax(S))
+     - alpha = exp2(scale_s * (m_old - m_new))
+     - P = exp2(scale_s * (S - m_new))
+     - l = alpha * l + sum(P)
+     - o_acc = alpha * o_acc + P_fp8 @ V_tile
+3. Final: O = o_acc / l * scale_o
+
+**Verified correct in kernel:**
+- Row-max `m` values match reference
+- Row-sum `l` values match reference (7.0208 for row 7)
+- Masking correctly sets P=0 for tiles 1-3 (kv >= 64 for row 7)
+
+**Still investigating:**
+- o_acc values are WRONG before final normalization
+- Kernel o_acc[7,:8] = [0.5772, 0.4867, 0.6153, 0.4604, ...]
+- Reference output[7,:8] = [0.5586, 0.4414, 0.5508, 0.4551, ...]
+- Bug is in P*V GEMM or o_acc accumulation
+
 ---
 
 ## Progress
