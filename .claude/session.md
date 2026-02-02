@@ -232,3 +232,20 @@ Reverting certain files can disable v3 kernel dispatch, causing tests to run v2 
 - `include/ck_tile/ops/fmha/kernel/fmha_fwd_v3_kernel.hpp` - v3 kernel implementation
 
 If you accidentally revert these, the tests will pass because they fall back to v2 kernels.
+
+---
+
+## WARNING: Debug Prints
+
+**Debug prints significantly increase compilation time.** Before running tests, wrap all debug prints in `#if 0` blocks:
+
+```cpp
+#if 0  // Debug: description
+    if(get_block_1d_id() == 0 && get_warp_id() == 0 && get_lane_id() == 0)
+    {
+        printf("[DEBUG] ...\n");
+    }
+#endif
+```
+
+Only enable debug prints (`#if 1`) when you specifically need to see the output. After debugging, disable them again before running the full test suite.
