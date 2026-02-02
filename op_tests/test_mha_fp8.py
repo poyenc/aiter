@@ -15,6 +15,175 @@ import argparse
 benchmark = {}
 
 
+def attention_fp8_ref_online(
+    q_fp8,
+    k_fp8,
+    v_fp8,
+    q_descale: float,
+    k_descale: float,
+    v_descale: float,
+    causal=False,
+    window_size=(-1, -1),
+    kv_tile_size=64,
+    debug=True,
+):
+    """
+    Reference implementation simulating online softmax with KV tiling.
+
+    This matches the kernel's tile-by-tile computation for debugging.
+    KV tile size = 64 (kN0 in the v3 pipeline).
+    """
+    if causal:
+        window_size = (window_size[0], 0)
+
+    batch_size, seqlen_q, nheads, d = q_fp8.shape
+    seqlen_k = k_fp8.shape[1]
+    d_v = v_fp8.shape[-1]
+
+    # FP8 E4M3 max value
+    fp8_max = torch.finfo(dtypes.fp8).max  # 448.0
+
+    # log2(e) for FAST_EXP2 path
+    log2e = math.log2(math.e)
+
+    # Dequantize fp8 inputs to fp32
+    q = q_fp8.float()
+    k = k_fp8.float()
+    v = v_fp8.float()
+
+    # Handle GQA
+    k = repeat(k, "b s h d -> b s (h g) d", g=nheads // k_fp8.shape[2])
+    v = repeat(v, "b s h d -> b s (h g) d", g=nheads // v_fp8.shape[2])
+
+    # scale_s = (1/sqrt(d)) * log2(e) * q_descale * k_descale
+    scale_s = (1.0 / math.sqrt(d)) * log2e * q_descale * k_descale
+    scale_p = fp8_max
+
+    # Initialize online softmax state
+    # m: row max (for numerical stability), shape [batch, nheads, seqlen_q]
+    # l: row sum of exp, shape [batch, nheads, seqlen_q]
+    # o_acc: output accumulator, shape [batch, seqlen_q, nheads, d_v]
+    m = torch.full((batch_size, nheads, seqlen_q), float("-inf"), device=q_fp8.device, dtype=torch.float32)
+    l = torch.zeros((batch_size, nheads, seqlen_q), device=q_fp8.device, dtype=torch.float32)
+    o_acc = torch.zeros((batch_size, seqlen_q, nheads, d_v), device=q_fp8.device, dtype=torch.float32)
+
+    num_kv_tiles = (seqlen_k + kv_tile_size - 1) // kv_tile_size
+
+    if debug:
+        print(f"\n{'='*60}")
+        print(f"[REF] Online softmax simulation: seqlen_q={seqlen_q}, seqlen_k={seqlen_k}, kv_tile_size={kv_tile_size}")
+        print(f"[REF] scale_s={scale_s:.6f}, scale_p={scale_p:.1f}")
+        print(f"[REF] num_kv_tiles={num_kv_tiles}")
+        print(f"{'='*60}")
+
+    for tile_idx in range(num_kv_tiles):
+        kv_start = tile_idx * kv_tile_size
+        kv_end = min(kv_start + kv_tile_size, seqlen_k)
+
+        # Get K, V tiles: [batch, tile_len, nheads, d]
+        k_tile = k[:, kv_start:kv_end, :, :]
+        v_tile = v[:, kv_start:kv_end, :, :]
+
+        # Step 1: Compute S = Q @ K_tile^T for this tile
+        # scores: [batch, nheads, seqlen_q, tile_len]
+        scores = torch.einsum("bthd,bshd->bhts", q, k_tile)
+
+        # Apply causal mask for this tile
+        if window_size[0] >= 0 or window_size[1] >= 0:
+            row_idx = torch.arange(seqlen_q, device=q_fp8.device, dtype=torch.long).view(-1, 1)
+            col_idx = torch.arange(kv_start, kv_end, device=q_fp8.device, dtype=torch.long)
+            if window_size[0] < 0:
+                # Causal only
+                mask = col_idx > row_idx + seqlen_k - seqlen_q + window_size[1]
+            else:
+                mask = torch.logical_or(
+                    col_idx > row_idx + seqlen_k - seqlen_q + window_size[1],
+                    col_idx < row_idx + seqlen_k - seqlen_q - window_size[0],
+                )
+            scores.masked_fill_(mask, float("-inf"))
+
+        # Step 2: Online softmax update
+        # Compute local row max for this tile
+        m_tile = scores.max(dim=-1).values  # [batch, nheads, seqlen_q]
+
+        # Handle fully masked rows
+        m_tile = torch.where(torch.isinf(m_tile), torch.full_like(m_tile, float("-inf")), m_tile)
+
+        # New global max
+        m_new = torch.maximum(m, m_tile)
+        # Handle case where both are -inf
+        m_new = torch.where(torch.isinf(m_new), torch.zeros_like(m_new), m_new)
+
+        # Rescaling factors
+        # alpha = exp2(scale_s * (m_old - m_new)) - rescale old accumulator
+        # For rows where m was -inf, alpha should be 0
+        alpha = torch.exp2(scale_s * (m - m_new))
+        alpha = torch.where(torch.isinf(m), torch.zeros_like(alpha), alpha)
+
+        # Compute P = exp2(scale_s * (scores - m_new))
+        p_compute = torch.exp2(scale_s * (scores - m_new.unsqueeze(-1)))
+
+        # Step 3: Rescale o_acc by alpha
+        # o_acc shape: [batch, seqlen_q, nheads, d_v]
+        # alpha shape: [batch, nheads, seqlen_q] -> [batch, seqlen_q, nheads, 1]
+        alpha_for_o = alpha.permute(0, 2, 1).unsqueeze(-1)
+        o_acc = o_acc * alpha_for_o
+
+        # Step 4: Rescale l by alpha and add new sum
+        l = l * alpha + p_compute.sum(dim=-1)
+
+        # Step 5: Quantize P to fp8 and accumulate PV
+        p_fp8 = (p_compute * scale_p).to(dtypes.fp8)
+        p_dequant = p_fp8.float()
+
+        # PV GEMM: [batch, nheads, seqlen_q, tile_len] @ [batch, tile_len, nheads, d_v]
+        # -> [batch, seqlen_q, nheads, d_v]
+        o_tile = torch.einsum("bhts,bshd->bthd", p_dequant, v_tile)
+        o_acc = o_acc + o_tile
+
+        # Update m
+        m = m_new
+
+        if debug:
+            print(f"\n[REF] Tile {tile_idx}: kv_range=[{kv_start}, {kv_end})")
+            b, h = 0, 0
+
+            # Print row-max details for multiple query rows
+            # Focus on rows at tile boundaries where causal mask changes behavior
+            # Also include row 7 to compare with kernel lane 7
+            query_rows_to_check = [0, 7, 63, 64, 127, 128, 191, 192, 255]
+            query_rows_to_check = [r for r in query_rows_to_check if r < seqlen_q]
+
+            for q_row in query_rows_to_check:
+                # Which KV tokens can this query row attend to?
+                # For causal: q_row can attend to kv indices 0..q_row (when seqlen_q == seqlen_k)
+                max_kv_for_row = q_row + seqlen_k - seqlen_q  # causal boundary
+
+                # Does this tile have any valid (non-masked) tokens for this query row?
+                tile_has_valid = kv_start <= max_kv_for_row
+
+                # Local row max for this tile
+                m_tile_row = scores[b, h, q_row, :].max().item()
+
+                print(f"  [q={q_row:3d}] m_tile={m_tile_row:12.1f}, m_global={m[b,h,q_row].item():12.1f}, "
+                      f"l={l[b,h,q_row].item():10.4f}, alpha={alpha[b,h,q_row].item():.6f}, "
+                      f"valid_in_tile={tile_has_valid}, causal_boundary={max_kv_for_row}")
+
+    # Final normalization: O = o_acc / l
+    l_for_div = l.permute(0, 2, 1).unsqueeze(-1).clamp(min=1e-9)
+    output = o_acc / l_for_div
+
+    # Apply output scale
+    scale_o = v_descale / scale_p
+    output = (output * scale_o).to(torch.bfloat16)
+
+    if debug:
+        print(f"\n[REF] Final output[0,0,0,:4] = {output[0,0,0,:4].tolist()}")
+        print(f"{'='*60}\n")
+
+    return output
+
+
 def attention_fp8_ref(
     q_fp8,
     k_fp8,
