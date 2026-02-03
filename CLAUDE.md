@@ -55,6 +55,14 @@ rm -f aiter/jit/*.so && python -m pytest op_tests/test_mha_fp8.py -v
 - `op_tests/` - Operator tests
 - `3rdparty/composable_kernel/` - AMD Composable Kernel library (submodule)
 
+## Best Practices
+
+- **Print more values:** When comparing kernel registers with reference, print 32+ elements, not just first 4-8. Matching on few elements doesn't mean all match.
+- **Verify completely before moving on:** When debugging intermediate values (sp_compute, m, l, P, V, o_acc), verify ALL rows before concluding correctness. Ask user to confirm findings before proceeding to next stage.
+- **Ask user for direction:** Before moving to the next debugging step, present options to the user and let them decide the direction. Do not assume what to check next.
+- **Batch kernel changes:** Debug prints require expensive recompilation. Plan all changes at once rather than incrementally.
+- **Only record verified facts:** Do not write conclusions or hypotheses in this document until they are verified by experiments. Record experiment results and observations, not speculation.
+
 ## Key Files
 
 ### FP8 Flash Attention
