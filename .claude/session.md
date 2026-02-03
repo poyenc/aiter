@@ -1,6 +1,6 @@
 # FP8 FMHA v3 Debug Session
 
-**Last Updated:** 2026-02-03 (P verified correct, V tile lanes 32-63 are ALL ZEROS - potential bug)
+**Last Updated:** 2026-02-03 (V tile lane mapping VERIFIED - all values correct)
 
 ## Current Focus
 
@@ -24,6 +24,10 @@ See [issues.md](issues.md) for full issue tracking and test results.
    - Both formulas are equivalent - kernel mask is correct
 
 3. **m (row max) and l (row sum)** verified via debug prints
+
+4. **P values (quantized softmax)** verified correct for all rows
+
+5. **V tile values** verified correct (see V Tile Lane Mapping section below)
 
 ---
 
@@ -176,8 +180,10 @@ For Issue #2 (causal + large seqlen), remaining possibilities:
 3. ~~Online softmax rescaling~~ (RULED OUT - works when mask disabled)
 4. ~~FP8 scale_p mismatch~~ (RULED OUT - scale_p = 448 is correct)
 5. ~~Causal mask off-by-one~~ (RULED OUT - kernel mask decisions are correct)
+6. ~~V tile values incorrect~~ (RULED OUT - verified with seqlen_k=64, all lanes correct)
 
-6. **`set_tile_if` with IsMasking=true** (HIGH - CURRENT FOCUS)
+7. **`set_tile_if` with IsMasking=true** (HIGH - CURRENT FOCUS)
+8. **PV GEMM or output normalization** - since all inputs (P, V) are correct
 
 ### Experiment Results (seqlen_q=32, seqlen_k=32)
 
@@ -481,16 +487,26 @@ V^T tensor [d_v=128, seqlen_k=5] (padded to [128, 32]):
 - Positions 64-95: Group 2 → V^T dim N+64
 - Positions 96-127: Group 3 → V^T dim N+96
 
-**Lanes 0-31:** All 128 V values per lane match reference ✓
+**V Tile Lane Mapping (VERIFIED with seqlen_k=64):**
 
-**Lanes 32-63:** ALL ZEROS ← **POTENTIAL BUG**
+For lane N (0-31) and lane N+32, each lane has 128 values in 4 groups of 32:
+- Group 0 (positions 0-31): V^T dim N
+- Group 1 (positions 32-63): V^T dim N+32
+- Group 2 (positions 64-95): V^T dim N+64
+- Group 3 (positions 96-127): V^T dim N+96
 
-The user noted that lanes 32-63 should have V values for seqlen_k=5. Need to investigate why they are all zeros.
+Within each group of 32, K positions are interleaved between lane N and lane N+32:
+- Lane N positions [0:8,8:16,16:24,24:32] = K positions [0:8,16:24,32:40,48:56]
+- Lane N+32 positions [0:8,8:16,16:24,24:32] = K positions [8:16,24:32,40:48,56:64]
+
+**seqlen_k=64:** All lanes 0-63 have correct V values ✓
+
+**seqlen_k=5:** Lanes 32-63 were ALL ZEROS because seqlen_k < 8, so only lane N (not lane N+32) has non-zero values. This is EXPECTED behavior, not a bug.
 
 ### Next Steps
 
-1. Investigate why V tile lanes 32-63 have all zeros
-2. Check if this is expected behavior or a bug in V tile loading
+1. V tile values are correct - bug must be elsewhere
+2. Re-investigate PV GEMM or output normalization
 
 ---
 
@@ -562,8 +578,9 @@ return i_x >= x_end || i_y >= y_total;
 - [x] Confirm `set_tile_if` works for IsMasking=false path
 - [x] Modify IsMasking=true path to only check padding → still differs by 0.02-0.04
 - [x] Case 3 & 4 comparison → `IsOutOfBound()` change produces identical output
+- [x] Verify V tile lane mapping with seqlen_k=64 → all values correct
+- [ ] **Investigate PV GEMM or output normalization** - V tile is correct, bug must be downstream
 - [ ] **Find the actual bug in causal masking logic**
-- [ ] Print FULL intermediate values (32+ elements) when debugging
 
 ---
 
