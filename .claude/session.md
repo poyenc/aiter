@@ -154,29 +154,16 @@ Example with seqlen_q=256, seqlen_k=64:
 
 ---
 
-## GEMM Config Comparison: v3 vs async_trload
+## Golden Reference for Debugging
 
-### GetQKBlockGemm (GEMM0: Q × K)
+**IMPORTANT:** Do not compare v3 kernel register values with async_trload pipeline due to different kernel/pipeline designs. Always use Python reference implementations as golden:
 
-| Aspect | v3 Pipeline | async_trload Pipeline |
-|--------|-------------|----------------------|
-| WarpGemm | Explicit: `WarpGemmMfma_f32_32x32x32_fp8_fp8_CTransposed<>{}` | Dispatcher: `WarpGemmDispatcher<..., true>` |
-| GemmLoopOrder | `MNK` | `MNK` |
+| Test Case | Golden Reference | Notes |
+|-----------|------------------|-------|
+| Single KV tile iteration | `attention_fp8_ref()` | Batch-style softmax (full row at once) |
+| Multiple KV tile iterations | `attention_fp8_ref_online()` | Online softmax (tile-by-tile) |
 
-Both use `GemmLoopOrder::MNK` - **no difference**.
-
-### GetPVBlockGemm (GEMM1: P × V) - **KEY DIFFERENCES**
-
-| Aspect | v3 Pipeline | async_trload Pipeline |
-|--------|-------------|----------------------|
-| WGAttrNumAccessEnum | Always `Double` | Conditional: `Double` only for (16×32) or (32×16), else `Single` |
-| GemmLoopOrder | **`MNK`** | **`KMN`** |
-
-**GemmLoopOrder difference is significant:**
-- `KMN`: Outer loop K → M → N (loops over K first, accumulation-oriented)
-- `MNK`: Outer loop M → N → K (loops over M, N first, row/col-oriented)
-
-**Potential impact:** The loop order affects how partial products are accumulated. For P×V with causal masking, when P rows have all-zero masked elements, the order of accumulation may produce different intermediate states.
+Both references are in `op_tests/test_mha_fp8.py`.
 
 ---
 
@@ -209,13 +196,137 @@ For Issue #2 (causal + large seqlen), remaining possibilities:
 
 ## Next Steps
 
-1. **Investigate why causal=True and causal=False produce different output even with same masking predicate**
-   - `IsEdgeTile()` has different logic for IsMasking=true vs false
-   - `l == 0 ? 0 : 1/l` vs `1/l` at final normalization (line 1517)
-   - `CoreLoopScheduler` has different specializations (scheduling only, shouldn't affect correctness)
+1. Verify `set_tile_if` is masking ALL padding positions (cols 5-63 for seqlen_k=5)
+2. Add kernel debug prints to inspect sp_compute values after masking
 
-2. **Verify sp_compute tile distribution is correct for set_tile_if:**
-   - Check if `get_x_indices_from_distributed_indices` returns correct (row, col)
+---
+
+## Investigation Progress (2026-02-03)
+
+### Smallest Reproduction Case Found
+
+**seqlen_k >= 5 fails, seqlen_k <= 4 passes**
+
+| seqlen_q | seqlen_k | Result | Notes |
+|----------|----------|--------|-------|
+| 4 | 4 | PASS | l_ref/l_kernel ratio = 1.0 |
+| 5 | 4 | PASS | Only seqlen_k matters |
+| 4 | 5 | FAIL | diff=0.22, l inflated |
+| 5 | 5 | FAIL | diff=0.17-0.22 |
+| 4 | 8 | FAIL | diff=0.46 (worst) |
+| 4 | 16 | borderline | diff=0.04 (below 0.055 threshold) |
+
+Test command:
+```bash
+python op_tests/debug_mha_fp8.py -q 5 -k 5 -d 128 -dv 128 --detailed
+```
+
+### Key Observation: `l` (row sum) is Inflated
+
+For seqlen_k=5, the kernel's `l` value is 14-22% larger than reference:
+```
+Row 0: l_ref=4.507, implied l_kernel≈5.27 (ratio=1.17)
+Row 4: l_ref=4.159, implied l_kernel≈4.76 (ratio=1.14)
+```
+
+This causes output to be too small: `output = o_acc / l`
+
+### v3 Pipeline Double Buffering Design
+
+The v3 pipeline uses **two register buffers** (`sp[0]` and `sp[1]`) to overlap computation:
+- While one buffer does PV GEMM, the other does QK GEMM
+- `pi` alternates between 0 and 1 to swap buffer roles
+
+**Buffer Index Mapping:**
+```cpp
+auto xdl_SP_p01_reg_idx = number<1>{} - pi;  // pi=0 → 1, pi=1 → 0
+auto xdl_SP_p23_reg_idx = pi;                 // pi=0 → 0, pi=1 → 1
+```
+
+**Core Loop Structure (`core_loop` calls `iteration(0)` then `iteration(1)`):**
+
+| Phase | pi=0 | pi=1 |
+|-------|------|------|
+| phase0 | cl_calc(1, gemm0) - QK GEMM → buf1 | cl_calc(0, gemm0) - QK GEMM → buf0 |
+| phase0 | fmha_alu1(0) - exp2/rowsum on buf0 | fmha_alu1(1) - exp2/rowsum on buf1 |
+| phase0 | fmha_logits_trans(1) | fmha_logits_trans(0) |
+| phase1 | fmha_mask(1) - mask buf1 | fmha_mask(0) - mask buf0 |
+| phase2 | cl_calc(0, gemm1) - PV GEMM w/ buf0 | cl_calc(1, gemm1) - PV GEMM w/ buf1 |
+| phase2 | fmha_alu0(1) - rowmax/delta on buf1 | fmha_alu0(0) - rowmax/delta on buf0 |
+
+**Key: fmha_alu0 is called on OTHER buffer during PV GEMM:**
+```cpp
+auto cl_calc = [&](auto sp_reg_idx, auto gemm_idx) {
+    if constexpr(gemm_idx == 1) {
+        gemm_1(o_acc, sp(sp_reg_idx).p, v_tile);
+        fmha_alu0(number<1>{} - sp_reg_idx);  // Process OTHER buffer!
+    }
+};
+```
+
+**Buffer Lifecycle (tracing buffer 1 across one full loop):**
+1. pi=0, phase0: `cl_calc(1, gemm0)` → QK GEMM fills sp_compute[1]
+2. pi=0, phase0: `fmha_logits_trans(1)` → transform sp_compute[1]
+3. pi=0, phase1: `fmha_mask(1)` → mask sp_compute[1] to -inf
+4. pi=0, phase2: `fmha_alu0(1)` → m = rowmax(sp_compute[1]), sp_delta[1]
+5. pi=1, phase0: `fmha_alu1(1)` → sp_compute[1] = exp2(sp_delta[1]), rowsum
+6. pi=1, phase2: `cl_calc(1, gemm1)` → PV GEMM using sp[1].p
+
+**Single KV Tile Case (num_total_loop=1):**
+
+Uses prologue + post_process instead of main loop:
+
+*Prologue (buffer 0):*
+1. `gemm(0, gemm0)` → QK GEMM fills sp_compute[0]
+2. `fmha_logits_trans(0)` → optional transform
+3. `fmha_mask(0)` → mask sp_compute[0] to -inf
+4. `fmha_alu0(0)` → m = rowmax(sp_compute[0]), sp_delta[0]
+
+*Post-process (buffer 0):*
+5. `fmha_alu1(0)` → sp_compute[0] = exp2(sp_delta[0]), l = sum
+6. `gemm(0, gemm1)` → PV GEMM
+
+**Conclusion:** Masking order is CORRECT in both single-tile and multi-tile cases.
+
+### Masking Logic Verified Correct
+
+For seqlen_q=5, seqlen_k=5, causal=True, row 4:
+- `IsEdgeTile()` returns true (64 > 5)
+- `IsOutOfBound(4, 5)` returns true (5 >= min(4+1, 5) = 5)
+- `should_mask` = true for col 5+
+- `sp_compute` should be set to -inf for cols 5-63
+
+For masked positions:
+- sp_compute = -inf
+- sp_delta = -inf * scale_s - scale_s * m = -inf
+- exp2(-inf) = 0
+- Contribution to rowsum = 0
+
+**Theory says masking should work, but l is still inflated.**
+
+### Remaining Questions
+
+1. Is `set_tile_if` actually iterating over ALL positions (cols 5-63)?
+2. Are there unmasked garbage values from K DRAM load beyond seqlen_k?
+3. Is there a race condition or memory issue in the double buffer?
+
+### Key Files for Further Investigation
+
+- `block_fmha_fwd_v3_pipeline.hpp:1125-1157` - fmha_mask lambda
+- `static_distributed_tensor.hpp` - set_tile_if implementation
+- `block_masking.hpp:214-235` - IsOutOfBound implementation
+
+---
+
+## Debug observations
+
+Mask decisions from debug print appear correct:
+- Row 0, col 0: should_mask=0 (valid)
+- Row 0, col 1: should_mask=1 (masked)
+- Row 1, col 1: should_mask=0 (valid)
+- Row 2, col 2: should_mask=0 (valid)
+
+The causal masking formula is working correctly.
 
 ---
 
@@ -239,7 +350,32 @@ Modified `IsOutOfBound()` for IsMasking=true to use `return i_x >= x_total`:
 |------|--------|
 | kernel causal=True vs causal=False | **0.0** (IDENTICAL) |
 
-**Conclusion:** The difference between Case 3 and Case 4 shows the bug is in other code that uses `mask.IsOutOfBound()` or `IsEdgeTile()`, not just the predicate in `set_tile_if`. The `IsEdgeTile()` function also has IsMasking-dependent logic that affects `need_perpixel_check`.
+### Observations from Case 3 & 4
+
+- Case 3: Modifying pipeline predicate alone gives diff=0.051 between causal=True and causal=False
+- Case 4: Modifying `IsOutOfBound()` to disable causal masking gives diff=0.0 (identical output)
+- This confirms the difference is in the causal masking code path, not elsewhere
+
+### IsMasking-Dependent Code Paths
+
+| Location | Function | IsMasking=true | IsMasking=false |
+|----------|----------|----------------|-----------------|
+| `block_masking.hpp:113` | `GetTileRangeAlongX()` | Causal-aware range | `(0, x_total)` |
+| `block_masking.hpp:267` | `IsEdgeTile()` | Causal edge check | Padding-only check |
+| `block_masking.hpp:214` | `IsOutOfBound()` | Causal mask | Padding-only |
+| `pipeline.hpp:1517` | Final normalization | Safe divide: `l==0 ? 0 : 1/l` | Direct: `1/l` |
+
+**Conclusion:** The bug must be in one of these IsMasking-dependent paths. Case 4 shows that aligning `IsOutOfBound()` produces identical output, but we need to find what's **incorrect** about the original causal logic.
+
+### v3 Mask Type (Verified from JIT-generated code)
+
+v3 (`QRKSVS_ASYNC_TRLOAD_V3`) uses `FmhaMasks::CausalMask` = `GenericAttentionMask<true, false>`:
+
+```cpp
+// IsOutOfBound for IsMasking=true:
+index_t x_end = min(i_y + x, x_total);
+return i_x >= x_end || i_y >= y_total;
+```
 
 ---
 
@@ -247,12 +383,10 @@ Modified `IsOutOfBound()` for IsMasking=true to use `return i_x >= x_total`:
 
 - [x] Verify scale_p value at runtime → 448 (correct)
 - [x] Verify mask formula matches reference → correct
-- [x] Compare GEMM config between v3 and async_trload
-- [x] Try changing v3 GEMM1 GemmLoopOrder from MNK to KMN → NOT THE BUG
 - [x] Confirm `set_tile_if` works for IsMasking=false path
 - [x] Modify IsMasking=true path to only check padding → still differs by 0.02-0.04
-- [ ] **Investigate `IsEdgeTile()` differences between IsMasking=true/false**
-- [ ] **Check final normalization `l == 0 ? 0 : 1/l` path**
+- [x] Case 3 & 4 comparison → `IsOutOfBound()` change produces identical output
+- [ ] **Find the actual bug in causal masking logic**
 - [ ] Print FULL intermediate values (32+ elements) when debugging
 
 ---
@@ -262,6 +396,8 @@ Modified `IsOutOfBound()` for IsMasking=true to use `return i_x >= x_total`:
 1. **Print more values:** When comparing kernel registers with reference, print 32+ elements, not just first 4-8. Matching on few elements doesn't mean all match.
 
 2. **Batch kernel changes:** Debug prints require expensive recompilation. Plan all changes at once rather than incrementally.
+
+3. **Only record verified facts:** Do not write conclusions or hypotheses in this document until they are verified by experiments. Record experiment results and observations, not speculation.
 
 ---
 
@@ -291,11 +427,10 @@ docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && pytho
 - v3 Kernel: `3rdparty/composable_kernel/include/ck_tile/ops/fmha/kernel/fmha_fwd_v3_kernel.hpp`
 - v3 Pipeline: `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_fwd_v3_pipeline.hpp`
 - v3 Policy: `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_fwd_v3_pipeline_default_policy.hpp`
-- async_trload Pipeline: `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs_async_trload.hpp`
-- async_trload Policy: `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs_async_trload_policy.hpp`
 - Masking: `3rdparty/composable_kernel/include/ck_tile/ops/fmha/block/block_masking.hpp`
 - Block GEMM: `3rdparty/composable_kernel/include/ck_tile/ops/gemm/block/block_gemm_areg_breg_creg_v2.hpp`
 - Test: `op_tests/test_mha_fp8.py`
+- Debug Script: `op_tests/debug_mha_fp8.py`
 
 ### Related Docs
 - [issues.md](issues.md) - Issue status and reproduction
