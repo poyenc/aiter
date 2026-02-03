@@ -1,6 +1,6 @@
 # FP8 FMHA v3 Debug Session
 
-**Last Updated:** 2026-02-02 (pytest verified: 48 failed, 128 passed)
+**Last Updated:** 2026-02-03 (P verified correct, V tile lanes 32-63 are ALL ZEROS - potential bug)
 
 ## Current Focus
 
@@ -194,16 +194,38 @@ For Issue #2 (causal + large seqlen), remaining possibilities:
 
 ---
 
+## Investigation Strategy
+
+**Prefer single KV iteration cases over multiple KV iteration cases.** Single KV tile cases (seqlen_k <= 64) are easier to analyze, and fixing the single-tile bug may also resolve multi-tile issues.
+
+---
+
 ## Next Steps
 
-1. Verify `set_tile_if` is masking ALL padding positions (cols 5-63 for seqlen_k=5)
-2. Add kernel debug prints to inspect sp_compute values after masking
+1. **Investigate why BOTH causal=True AND causal=False fail with seqlen=5**
+2. The bug is NOT specific to causal masking - it's more fundamental
+3. Focus on single KV tile iteration first (seqlen_k <= 64)
 
 ---
 
 ## Investigation Progress (2026-02-03)
 
-### Smallest Reproduction Case Found
+### CRITICAL FINDING: Both causal=True and causal=False fail with seqlen=5
+
+| seqlen_q | seqlen_k | causal | Result | Max Diff |
+|----------|----------|--------|--------|----------|
+| 5 | 5 | True | **FAIL** | 0.171875 |
+| 5 | 5 | False | **FAIL** | 0.21484375 |
+
+**This means the bug is NOT specific to causal masking!** There's a fundamental issue affecting both paths.
+
+Test commands:
+```bash
+python op_tests/test_mha_fp8.py -b 1 -n 1 -q 5 -k 5 -d 128 -dv 128 -c   # causal=True, FAIL
+python op_tests/test_mha_fp8.py -b 1 -n 1 -q 5 -k 5 -d 128 -dv 128      # causal=False, FAIL
+```
+
+### Previous Findings (for reference)
 
 **seqlen_k >= 5 fails, seqlen_k <= 4 passes**
 
@@ -221,15 +243,105 @@ Test command:
 python op_tests/debug_mha_fp8.py -q 5 -k 5 -d 128 -dv 128 --detailed
 ```
 
-### Key Observation: `l` (row sum) is Inflated
+### sp_compute BEFORE mask - Values are CORRECT
 
-For seqlen_k=5, the kernel's `l` value is 14-22% larger than reference:
+Verified sp_compute values for seqlen_q=5, seqlen_k=5, causal=False:
+
+| Lane | sp_compute (first 5 elements) | Non-zero |
+|------|-------------------------------|----------|
+| 0 | 7007472, 7174656, 6797624, 6828704, 0 | 4 |
+| 32 | 6855368, 0, 0, 0, 0 | 1 |
+| 1 | 7189576, 6560984, 6903760, 6868416, 0 | 4 |
+| 33 | 7156080, 0, 0, 0, 0 | 1 |
+| 2 | 6515552, 6469640, 6929944, 6528576, 0 | 4 |
+| 34 | 6410296, 0, 0, 0, 0 | 1 |
+| 3 | 6877168, 6180480, 6553152, 6495384, 0 | 4 |
+| 35 | 6126112, 0, 0, 0, 0 | 1 |
+| 4 | 6804200, 6883260, 7315240, 6825688, 0 | 4 |
+| 36 | 6574818, 0, 0, 0, 0 | 1 |
+
+**Reference scores (from Python):**
+| Row | Scores (5 values) |
+|-----|-------------------|
+| 0 | 7007482, 7174656, 6797630, 6828704, 6855368 |
+| 1 | 7189577, 6560993, 6903767, 6868421, 7156080 |
+| 2 | 6515553, 6469640, 6929946, 6528576, 6410300 |
+| 3 | 6877176, 6180488, 6553155, 6495391, 6126118 |
+| 4 | 6804202, 6883274, 7315249, 6825693, 6574818 |
+
+**Conclusion:** sp_compute values match reference! QK GEMM is correct.
+- Lane N holds positions 0-3 (first 4 values)
+- Lane N+32 holds position 4 (5th value)
+
+---
+
+### m (row max) after fmha_alu0 - Values are CORRECT
+
+| Lane | m value | Reference | Match |
+|------|---------|-----------|-------|
+| 0, 32 | 7174656 | 7174656 | ✓ |
+| 1, 33 | 7189576 | 7189577 | ✓ |
+| 2, 34 | 6929944 | 6929946 | ✓ |
+| 3, 35 | 6877168 | 6877176 | ✓ |
+| 4, 36 | 7315240 | 7315249 | ✓ |
+
+Paired lanes (N and N+32) get same m value after reduction. All values match reference.
+
+---
+
+### l (row sum) after fmha_alu1 - Values are CORRECT
+
+| Lane | l value | Reference | Match |
+|------|---------|-----------|-------|
+| 0 | 4.5071 | 4.507151 | ✓ |
+| 1 | 4.4970 | 4.496964 | ✓ |
+| 2 | 4.2882 | 4.288185 | ✓ |
+| 3 | 4.1721 | 4.172113 | ✓ |
+| 4 | 4.1589 | 4.158861 | ✓ |
+
+All l values match reference!
+
+---
+
+### Bug NOT in softmax - Must be downstream
+
+Since sp_compute, m, and l are all correct, the bug must be in:
+1. P quantization to FP8 (`sp.p`)
+2. PV GEMM (`o_acc = P @ V`)
+3. Final normalization (`O = o_acc / l * scale_o`)
+
+---
+
+### ~~Key Observation: `l` (row sum) is Inflated~~ **CORRECTED**
+
+**This was a wrong conclusion.** The "implied l" was calculated backwards assuming o_acc was correct. Direct kernel debugging shows `l` is actually CORRECT.
+
+Since output is smaller than expected but `l` is correct, the bug must be in `o_acc` (PV GEMM result) being **larger** than expected.
+
+Original (incorrect) analysis for reference:
 ```
 Row 0: l_ref=4.507, implied l_kernel≈5.27 (ratio=1.17)
 Row 4: l_ref=4.159, implied l_kernel≈4.76 (ratio=1.14)
 ```
 
 This causes output to be too small: `output = o_acc / l`
+
+### sp_compute Buffer Roles
+
+`sp_compute` is reused in-place for multiple stages:
+1. **QK GEMM result**: After `gemm(sp_reg_idx, gemm0)`, stores raw Q×K scores
+2. **Masked QK result**: After `fmha_mask()`, padding/causal positions set to -inf
+3. **sp_delta computed**: After `fmha_alu0()`:
+   - Computes `m = rowmax(sp_compute)`
+   - Computes `sp_delta = scale_s * (sp_compute - m)` (stored in separate buffer)
+   - sp_compute is NOT modified here
+4. **Softmax result**: After `fmha_alu1()`, sp_compute = exp2(sp_delta)
+
+This in-place reuse means debugging must check values at the correct stage.
+
+**Important:** Do NOT assume which lane owns which row or column positions. Always check the FULL output from multiple lanes and wait for user confirmation before drawing conclusions about the row/column distribution pattern.
+
+---
 
 ### v3 Pipeline Double Buffering Design
 
@@ -318,6 +430,70 @@ For masked positions:
 
 ---
 
+## Investigation Progress (2026-02-03 continued)
+
+### P Values Verified CORRECT
+
+All P values match reference for all 5 rows (seqlen_q=5, seqlen_k=5, causal=False):
+
+| Row | Lane (cols 0-3) | Lane+32 (col 4) | Match |
+|-----|-----------------|-----------------|-------|
+| 0 | [125, 126, 124, 124] | [124] | ✓ |
+| 1 | [126, 123, 124, 124] | [126] | ✓ |
+| 2 | [124, 123, 126, 124] | [123] | ✓ |
+| 3 | [126, 122, 124, 124] | [122] | ✓ |
+| 4 | [123, 124, 126, 123] | [122] | ✓ |
+
+**Conclusion:** QK GEMM, masking, softmax (m, l), and P quantization are all correct.
+
+### V Tile Investigation
+
+**V tile distribution (verified for lanes 0-31):**
+
+```
+V^T tensor [d_v=128, seqlen_k=5] (padded to [128, 32]):
+
+              K positions (seqlen_k=5, padded to 32)
+              0   1   2   3   4   5...31 (zeros)
+             ┌───┬───┬───┬───┬───┬─────────┐
+  dim  0     │     Lane 0, Group 0        │
+  dim  1     │     Lane 1, Group 0        │
+  ...        │         ...                │
+  dim 31     │     Lane 31, Group 0       │
+             ├───────────────────────────-┤
+  dim 32     │     Lane 0, Group 1        │
+  ...        │         ...                │
+  dim 63     │     Lane 31, Group 1       │
+             ├───────────────────────────-┤
+  dim 64     │     Lane 0, Group 2        │
+  ...        │         ...                │
+  dim 95     │     Lane 31, Group 2       │
+             ├───────────────────────────-┤
+  dim 96     │     Lane 0, Group 3        │
+  ...        │         ...                │
+  dim 127    │     Lane 31, Group 3       │
+             └───────────────────────────-┘
+```
+
+**Lane N thread_buf_ layout (128 elements):**
+- Positions 0-31: Group 0 → V^T dim N
+- Positions 32-63: Group 1 → V^T dim N+32
+- Positions 64-95: Group 2 → V^T dim N+64
+- Positions 96-127: Group 3 → V^T dim N+96
+
+**Lanes 0-31:** All 128 V values per lane match reference ✓
+
+**Lanes 32-63:** ALL ZEROS ← **POTENTIAL BUG**
+
+The user noted that lanes 32-63 should have V values for seqlen_k=5. Need to investigate why they are all zeros.
+
+### Next Steps
+
+1. Investigate why V tile lanes 32-63 have all zeros
+2. Check if this is expected behavior or a bug in V tile loading
+
+---
+
 ## Debug observations
 
 Mask decisions from debug print appear correct:
@@ -388,16 +564,6 @@ return i_x >= x_end || i_y >= y_total;
 - [x] Case 3 & 4 comparison → `IsOutOfBound()` change produces identical output
 - [ ] **Find the actual bug in causal masking logic**
 - [ ] Print FULL intermediate values (32+ elements) when debugging
-
----
-
-## Best Practices
-
-1. **Print more values:** When comparing kernel registers with reference, print 32+ elements, not just first 4-8. Matching on few elements doesn't mean all match.
-
-2. **Batch kernel changes:** Debug prints require expensive recompilation. Plan all changes at once rather than incrementally.
-
-3. **Only record verified facts:** Do not write conclusions or hypotheses in this document until they are verified by experiments. Record experiment results and observations, not speculation.
 
 ---
 

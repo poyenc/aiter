@@ -6,7 +6,28 @@ For current status and open issues, see [session.md](session.md).
 
 ---
 
-## Issue #2 Investigation (2026-02-02)
+## Issue #2 Investigation (2026-02-03)
+
+### CRITICAL FINDING: Bug is NOT causal-specific
+
+**Both causal=True AND causal=False fail with seqlen_k=5:**
+
+| seqlen_q | seqlen_k | causal | Result | Max Diff |
+|----------|----------|--------|--------|----------|
+| 5 | 5 | True | **FAIL** | 0.171875 |
+| 5 | 5 | False | **FAIL** | 0.21484375 |
+
+This proves the bug is in padding/edge tile handling, NOT in causal masking logic.
+
+**Failure pattern:** 5 ≤ seqlen_k ≤ 64 (single KV tile with partial fill)
+
+### Investigation Strategy
+
+Focus on single KV tile cases (seqlen_k ≤ 64) first since:
+1. Easier to analyze (no multi-tile accumulation)
+2. Fixing single-tile bug may also resolve multi-tile issues
+
+---
 
 ### Ruled Out Hypotheses
 

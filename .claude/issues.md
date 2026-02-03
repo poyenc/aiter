@@ -5,7 +5,7 @@
 | ID | Issue | Status | Affects | Root Cause |
 |----|-------|--------|---------|------------|
 | #1 | [K Tile Half-Stride Bug](#issue-1-k-tile-half-stride-bug) | ✓ FIXED | All FP8, all seqlen | SwizzleB warp GEMM half-stride |
-| #2 | [Causal + Large Seqlen Bug](#issue-2-causal--large-seqlen-bug) | 🔴 OPEN | causal=True, seqlen≥256 | Unknown (investigating) |
+| #2 | [Small Seqlen Bug](#issue-2-small-seqlen-bug) | 🔴 OPEN | 5 ≤ seqlen_k ≤ 64, both causal modes | Unknown (investigating) |
 | #3 | [V Tile Transpose Load Bug](#issue-3-v-tile-transpose-load-bug) | ⚠️ BYPASSED | FP8 V tile loading | Coordinate mismatch |
 
 > **Note:** Replace `<CONTAINER>` and `<WORKSPACE>` with values from `.claude/user.md`
@@ -52,27 +52,35 @@ docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && pytho
 
 ---
 
-## Issue #2: Causal + Large Seqlen Bug
+## Issue #2: Small Seqlen Bug (Single KV Tile)
 
 ### Status: 🔴 OPEN (Root cause unknown)
 
 ### Description
-Tests fail when **causal=True** AND **seqlen ≥ 256**. All other combinations pass.
+Tests fail when **5 ≤ seqlen_k ≤ 64** (single KV tile iteration). **Both causal=True AND causal=False fail**, so this is NOT a causal masking bug.
 
-### Current Test Result (2026-02-02)
+This is now the primary focus since single KV tile cases are easier to analyze, and fixing this may also resolve multi-tile issues.
+
+### Current Test Result (2026-02-03)
+
+**CRITICAL: Both causal modes fail with seqlen=5**
+
+| seqlen_q | seqlen_k | causal | Result | Max Diff |
+|----------|----------|--------|--------|----------|
+| 5 | 5 | True | **FAIL** | 0.171875 |
+| 5 | 5 | False | **FAIL** | 0.21484375 |
+| 4 | 4 | True | PASS | < 0.055 |
+| 4 | 4 | False | PASS | < 0.055 |
 
 ```bash
-python op_tests/test_mha_fp8.py -b 1 -n 1 -q 256 -k 64 -d 128 -dv 128 -c
-```
+# Both fail
+python op_tests/test_mha_fp8.py -b 1 -n 1 -q 5 -k 5 -d 128 -dv 128 -c   # causal=True, FAIL
+python op_tests/test_mha_fp8.py -b 1 -n 1 -q 5 -k 5 -d 128 -dv 128      # causal=False, FAIL
 
-**Output:**
+# Both pass
+python op_tests/test_mha_fp8.py -b 1 -n 1 -q 4 -k 4 -d 128 -dv 128 -c   # causal=True, PASS
+python op_tests/test_mha_fp8.py -b 1 -n 1 -q 4 -k 4 -d 128 -dv 128      # causal=False, PASS
 ```
-Output max diff (kernel vs bf16 ref): 0.287109375
-Output max diff (kernel vs online ref): 0.271484375
-Output max diff (bf16 ref vs online ref): 0.03515625
-```
-
-The two references agree with each other (diff=0.035), but kernel differs from both by ~0.27-0.29.
 
 ### Ruled Out (Verified Correct)
 
@@ -89,26 +97,33 @@ The two references agree with each other (diff=0.035), but kernel differs from b
 4. **GemmLoopOrder mismatch** (RULED OUT)
    - v3 uses `MNK` for GEMM1, async_trload uses `KMN`
    - Tested: Changed to KMN with matching P+V distributions
-   - Result: Test still fails with same diff (0.287)
+   - Result: Test still fails with same diff
+
+5. **Causal masking specific bug** (RULED OUT)
+   - Both causal=True and causal=False fail with seqlen=5
+   - Bug is NOT specific to causal masking
 
 ### Remaining Hypotheses
 
-1. **P×V GEMM computation** (HIGH)
+1. **Padding/edge tile handling** (HIGH)
+   - seqlen_k=5 means only 5 valid K positions in a 64-wide tile
+   - Positions 5-63 should be masked as padding
+   - Bug may be in how padding positions are handled
+
+2. **P×V GEMM computation** (MEDIUM)
    - P values appear correct, V loading appears correct
    - But o_acc output differs from reference
-   - May be issue in GEMM1 data layout or accumulation
-
-2. **Online softmax rescaling** (MEDIUM)
-   - The `o_acc *= exp2(scale_s * (m_old - m_new))` rescaling
-   - May have issue when some lanes have all-masked P values
 
 ### Reproduction
 ```bash
-# Fails
-docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 1 -q 256 -k 64 -d 128 -dv 128 -c"
+# Smallest failing case (single KV tile, seqlen_k=5)
+docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 1 -q 5 -k 5 -d 128 -dv 128"
 
-# Passes (same config, no causal)
-docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 1 -q 256 -k 64 -d 128 -dv 128"
+# Passing case (seqlen_k=4, just below failure threshold)
+docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 1 -q 4 -k 4 -d 128 -dv 128"
+
+# Large seqlen cases pass with causal=False
+docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 1 -q 256 -k 256 -d 128 -dv 128"
 ```
 
 ### Test Results (2026-01-31)
