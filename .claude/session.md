@@ -503,11 +503,28 @@ Within each group of 32, K positions are interleaved between lane N and lane N+3
 
 **seqlen_k=5:** Lanes 32-63 were ALL ZEROS because seqlen_k < 8, so only lane N (not lane N+32) has non-zero values. This is EXPECTED behavior, not a bug.
 
+### Two Separate Bugs Identified
+
+| Test Case | Result | Root Cause |
+|-----------|--------|------------|
+| seqlen_k=64, causal=False | **PASS** (0.023) | - |
+| seqlen_k=64, causal=True | **FAIL** (0.287) | Bug #2: Causal masking |
+| seqlen_k=5, causal=False | **FAIL** (0.21) | Bug #1: Missing K positions |
+
+**Bug #1: PV GEMM Missing K Positions (NEW)**
+- K positions 4-7 not contributing when seqlen_k is not 8-aligned
+- Affects: seqlen_k=5-11, 24, etc. with causal=False
+- Root cause: V values not accumulated in PV GEMM (P is correct)
+
+**Bug #2: Causal Masking (ORIGINAL)**
+- Large seqlen fails with causal=True
+- Affects: seqlen_k=64, 256 with causal=True
+- Root cause: Still under investigation
+
 ### Next Steps
 
-1. Investigate why K position 4 is not contributing to PV GEMM
-2. Check P values distribution for K positions 4-7 (lane N+32)
-3. Check V tile slicing in gemm_1 call
+1. Bug #1: Investigate why V[K=4-7] not accumulated in PV GEMM
+2. Bug #2: Separate investigation for causal masking issue
 
 ---
 
@@ -549,12 +566,76 @@ When seqlen_k <= 4, all K positions (0 to seqlen_k-1) are contributing. The miss
 
 When seqlen_k >= 5, K position 4 has valid data but is not accumulated, causing incorrect output.
 
-### Root Cause (To Investigate)
+### Complete Test: seqlen_k 1 to 64
 
-Need to determine why K position 4 is not accumulated:
-1. Is P[q,4] correctly computed and distributed?
-2. Is V[4] correctly loaded into the V tile?
-3. Is the GEMM instruction correctly configured?
+```
+seqlen_k | Missing K Positions
+---------|--------------------
+   1-4   | OK
+   5     | [4]
+   6     | [4, 5]
+   7     | [4, 5, 6]
+   8     | [4, 5, 6, 7]
+   9     | [5, 6, 7]
+  10     | [6, 7]
+  11     | [7]
+  12-20  | OK
+  21     | [20]
+  22     | [20, 21]
+  23     | [20, 21, 22]
+  24     | [20, 21, 22, 23]
+  25     | [21, 22, 23]
+  26     | [22, 23]
+  27     | [23]
+  28-36  | OK
+  37-43  | [36..39] (same pattern)
+  44-52  | OK
+  53-59  | [52..55] (same pattern)
+  60-64  | OK
+```
+
+### Pattern Diagram
+
+```
+K Position Layout (16-element blocks):
+┌─────────────────────────────────────────────────────────────────────┐
+│  Positions 0-3   │  Positions 4-7   │  Positions 8-11  │ Pos 12-15 │
+│     (OK)         │     (BUG!)       │     (OK)         │   (OK)    │
+└─────────────────────────────────────────────────────────────────────┘
+
+Affected seqlen_k ranges (repeats every 16):
+  [5-11], [21-27], [37-43], [53-59], ...
+
+Formula: Bug occurs when (seqlen_k % 16) is in range [5, 11]
+```
+
+### Pattern Analysis
+
+The bug affects **positions 4-7 within each 16-element block** when seqlen_k partially covers that range:
+- Positions 4-7, 20-23, 36-39, 52-55, ... are the "second group" in each 16-block
+- These positions are NOT accumulated in PV GEMM when seqlen_k falls in buggy ranges
+
+### P vs V Test
+
+To isolate whether the bug is in P (attention weights) or V (value accumulation):
+
+| Modification | K=4 Contribution | Conclusion |
+|--------------|------------------|------------|
+| K[pos=4]=0 (affects P) | **diff=0.168** | P is correct |
+| V[pos=4]=0 (affects O) | **diff=0.000** | V not accumulated |
+
+**Conclusion:** P[K=4] is correctly computed. The bug is specifically in **PV GEMM not using V[K=4]**.
+
+### Root Cause Hypothesis
+
+The v3 pipeline processes K in 16-element blocks (2 groups of 8). Within each 16-block:
+- Group 0 (positions 0-3, 8-11): Correctly accumulated
+- Group 1 (positions 4-7, 12-15): **NOT accumulated for certain seqlen_k**
+
+This suggests a bug in:
+1. Loop iteration logic (skipping odd-numbered 8-element groups)
+2. V tile slicing in gemm_1 call
+3. Double-buffering handling for partial tiles
 
 ---
 
