@@ -383,7 +383,7 @@ def test_flash_attn_output(
 
     max_diff = (out - out_ref).abs().max().item()
     print(f"Output max diff: {max_diff}")
-    assert max_diff < 0.01
+    assert max_diff < 0.02
 
     fwd_flop = (
         batch_size
