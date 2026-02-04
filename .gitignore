@@ -60,6 +60,6 @@ aiter/install_mode
 # AI agent config (keep .claude/*.md for documentation)
 .claude/*
 !.claude/user.md.example
-!.claude/findings.md
 !.claude/issues.md
 !.claude/session.md
+!.claude/knowledge.md

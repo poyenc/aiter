@@ -9,7 +9,6 @@
 2. **During work**:
    - Update `session.md` with progress, hypothesis, and TODO changes
    - Update `issues.md` when issue status or test results change
-   - Add detailed experiments to `findings.md`
 
 3. **Before ending** (before compacting is triggered OR user exits conversation):
    - Update `session.md` with latest progress and next steps
@@ -43,9 +42,9 @@ rm -f aiter/jit/*.so && python -m pytest op_tests/test_mha_fp8.py -v
 
 ## Technical Documentation
 
-- [Session Notes](.claude/session.md) - Progress, hypothesis, TODO, and next steps
+- [Session Notes](.claude/session.md) - Current focus, next steps, and TODO
 - [Issue Tracker](.claude/issues.md) - Issue status, reproduction steps, and test results
-- [Investigation Findings](.claude/findings.md) - Detailed experiments, root cause analysis, and historical notes
+- [Technical Knowledge](.claude/knowledge.md) - Pipeline design, lane mapping, and debugging insights
 - [FP8 Attention Notes](op_tests/FP8_ATTENTION_NOTES.md) - FP8 attention kernel behavior and reference implementation details
 
 ## Project Structure

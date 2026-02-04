@@ -244,8 +244,7 @@ static constexpr bool distr_encoding_valid =
 This issue was initially investigated as the root cause of the 8-lane offset bug, but the actual cause was Issue #1 (K tile half-stride). The V tile issue may still cause problems in certain configurations.
 
 ### Related
-- See [findings.md](findings.md) for 9 failed fix attempts
-- May be related to Issue #2 (causal + large seqlen failures)
+- May be related to Issue #2 (P/V distribution mismatch)
 
 ---
 
