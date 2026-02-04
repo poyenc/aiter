@@ -1,50 +1,43 @@
 # FP8 FMHA v3 Debug Session
 
-**Last Updated:** 2026-02-03
+**Last Updated:** 2026-02-04
 
 ---
 
 ## Current Status
 
-**ROOT CAUSE IDENTIFIED** - P and V tile distribution mismatch in PV GEMM.
+**FIXED** - FP8 FMHA v3 pipeline now produces correct outputs.
 
-See [knowledge.md](knowledge.md) for technical details on the root cause.
+**Root Cause:** P/V lane distribution mismatch in PV GEMM. Lane 32 had P[K=4] but V was all zeros.
 
----
+**Fix:** Changed QK GEMM warp gemm from `WarpGemmMfma_f32_32x32x32_fp8_fp8_CTransposed<>{}` to `WarpGemmMfmaFp8Fp8F32M32N32K32SwizzleBTransposedCDistribution<>{}`. The SwizzleB variant provides 8 contiguous K positions per lane (vs 4), aligning P (sp_compute) distribution with V tile distribution.
 
-## Root Cause Summary
-
-P[K=4] is in lane 32 but V[K=4] is in lane 0, causing `P[K=4] × V[K=4] = 124 × 0 = 0`.
-
-| Tile | Distribution Source | K=4 Location |
-|------|---------------------|--------------|
-| P | `MakePRegTileDistribution()` | Lane 32 |
-| V | `MakeVRegTileDistribution()` | Lane 0 |
-
-**Why seqlen_k <= 4 works:** All data in lane 0 for both P and V.
-**Why seqlen_k >= 5 fails:** Lane 32 has P[K=4] but V is zeros.
+**Test Results:**
+- Minimal reproducer (q=1, k=5): Output max diff = 0.0
+- Full pytest suite: **176/176 tests pass**
 
 ---
 
-## Next Steps
+## Fix Details
 
-1. Fix `MakeVRegTileDistribution()` to match P's distribution after transpose
-2. Or fix `MakePRegTileDistribution()` to match V's distribution
-3. Verify fix with full pytest suite
+**File:** `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_fwd_v3_pipeline_default_policy.hpp`
 
----
+**Change in GetQKBlockGemm():**
+```cpp
+// Before:
+return WarpGemmMfma_f32_32x32x32_fp8_fp8_CTransposed<>{};
 
-## Verified Correct (Ruled Out)
+// After:
+// Use SwizzleB variant to get 8 contiguous K positions per lane,
+// matching the V tile distribution for PV GEMM
+return WarpGemmMfmaFp8Fp8F32M32N32K32SwizzleBTransposedCDistribution<>{};
+```
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| scale_p = 448 | CORRECT | Debug print confirmed |
-| Causal mask formula | CORRECT | Matches reference |
-| m (row max) | CORRECT | All lanes match |
-| l (row sum) | CORRECT | All lanes match |
-| P values (FP8) | CORRECT | All rows match |
-| V tile values | CORRECT | Verified with seqlen_k=64 |
-| QK GEMM | CORRECT | sp_compute matches reference |
+**Why this works:**
+- Non-SwizzleB: kCM1PerLane = 4 → Lane 0 owns K[0,1,2,3], Lane 32 owns K[4,5,6,7]
+- SwizzleB (SFactor=2): kCM1PerLane * SFactor = 8 → Lane 0 owns K[0,1,2,3,4,5,6,7]
+- V tile distribution puts all 5 valid K positions in Lane 0
+- With SwizzleB, P[K=0-7] is also in Lane 0, so P × V works correctly
 
 ---
 
@@ -54,8 +47,10 @@ P[K=4] is in lane 32 but V[K=4] is in lane 0, causing `P[K=4] × V[K=4] = 124 ×
 - [x] Verify mask formula → correct
 - [x] Verify V tile lane mapping → correct
 - [x] Identify root cause → P/V distribution mismatch
-- [ ] Fix distribution mismatch in v3 policy
-- [ ] Run full pytest suite to verify fix
+- [x] Verify attention_fp8_ref_online() is correct (verified 2026-02-04)
+- [x] Fix distribution mismatch in v3 policy (SwizzleB variant)
+- [x] Run full pytest suite to verify fix (176/176 passed)
+- [ ] Commit fix with documentation
 
 ---
 
@@ -65,11 +60,8 @@ P[K=4] is in lane 32 but V[K=4] is in lane 0, causing `P[K=4] × V[K=4] = 124 ×
 # Full pytest suite (source of truth)
 docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python -m pytest op_tests/test_mha_fp8.py -v"
 
-# Single failing test (causal)
-docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 1 -q 256 -k 64 -d 128 -dv 128 -c"
-
-# Single passing test (non-causal)
-docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 1 -q 256 -k 64 -d 128 -dv 128"
+# Single test (minimal reproducer)
+docker exec <CONTAINER> bash -c "cd <WORKSPACE> && rm -f aiter/jit/*.so && python op_tests/test_mha_fp8.py -b 1 -n 1 -q 1 -k 5 -d 128 -dv 128"
 ```
 
 > Replace `<CONTAINER>` and `<WORKSPACE>` with values from `.claude/user.md`

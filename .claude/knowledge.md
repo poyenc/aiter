@@ -241,26 +241,41 @@ Compares three implementations:
 
 ---
 
-## P and V Distribution Mismatch (Root Cause of Issue #2)
+## P and V Distribution Mismatch (Root Cause - FIXED)
 
 For PV GEMM to compute correctly, when lane N has P[K=k], the same lane should have V[K=k].
 
-**Observed mismatch (seqlen_q=5, seqlen_k=5):**
+**Observed mismatch (seqlen_q=1, seqlen_k=5):**
 
-| Lane | P values | V values | Problem |
-|------|----------|----------|---------|
+| Lane | P values (before fix) | V values | Problem |
+|------|----------------------|----------|---------|
 | 0 | P[K=0,1,2,3] | V[K=0,1,2,3,4] | V[K=4] exists but P[K=4] missing |
 | 32 | P[K=4]=124 | ALL ZEROS | P[K=4] exists but V[K=4] missing |
 
 Result: `P[K=4] × V[K=4] = 124 × 0 = 0`
 
-**Distribution sources:**
-- P: `MakePRegTileDistribution()` → `BlockGemm::MakeABlockDistributionEncode()`
-- V: `MakeVRegTileDistribution()` → custom with `WarpGemm::BWarpDstrEncoding` + `TransposedDstrEncode`
+**Root Cause:**
+- Non-SwizzleB warp gemm: kCM1PerLane = 4 contiguous K positions per lane
+- V tile distribution: 8 contiguous K positions per lane (due to transpose)
+- Mismatch causes P[K=4] (lane 32) to multiply with V[K=?] (zeros in lane 32)
 
-The transpose operation on V changes its lane mapping differently than P.
+**Fix (2026-02-04):**
 
-**async_trload (working)** uses same dimension ordering for both P and V (`sequence<2, 1>`).
+Changed QK GEMM warp gemm in `GetQKBlockGemm()`:
+```cpp
+// Before:
+return WarpGemmMfma_f32_32x32x32_fp8_fp8_CTransposed<>{};
+
+// After:
+return WarpGemmMfmaFp8Fp8F32M32N32K32SwizzleBTransposedCDistribution<>{};
+```
+
+**Why SwizzleB fixes it:**
+- SwizzleB (SFactor=2): kCM1PerLane * SFactor = 8 contiguous K positions
+- This matches V tile distribution (8 K positions per lane)
+- Lane 0 now has P[K=0-7], matching V[K=0-7]
+
+**Test Results:** 176/176 tests pass
 
 ---
 
