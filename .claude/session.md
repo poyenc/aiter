@@ -505,8 +505,56 @@ Within each group of 32, K positions are interleaved between lane N and lane N+3
 
 ### Next Steps
 
-1. V tile values are correct - bug must be elsewhere
-2. Re-investigate PV GEMM or output normalization
+1. Investigate why K position 4 is not contributing to PV GEMM
+2. Check P values distribution for K positions 4-7 (lane N+32)
+3. Check V tile slicing in gemm_1 call
+
+---
+
+## VERIFIED BUG: K Position 4 Not Contributing to PV GEMM (2026-02-03)
+
+### Test: `op_tests/debug_mha_fp8.py`
+
+```bash
+python op_tests/debug_mha_fp8.py
+```
+
+**Test methodology:**
+1. Run kernel with original V → get `out_orig`
+2. For each K position, set `v_quant[:, k_pos, :, :] = 0` directly (same `v_descale`)
+3. Run kernel with modified V → get `out_mod`
+4. If `diff = |out_orig - out_mod| == 0`, K position is NOT contributing
+
+**Result (seqlen_q=5, seqlen_k=5, causal=False):**
+
+| V Modification | Output Diff | Conclusion |
+|----------------|-------------|------------|
+| V[K=0]=0 | 0.240234 | K=0 contributing (OK) |
+| V[K=1]=0 | 0.222656 | K=1 contributing (OK) |
+| V[K=2]=0 | 0.240234 | K=2 contributing (OK) |
+| V[K=3]=0 | 0.207031 | K=3 contributing (OK) |
+| V[K=4]=0 | **0.000000** | **K=4 NOT contributing (BUG!)** |
+
+### Implication
+
+The PV GEMM (`O = P @ V`) is missing K position 4's contribution:
+- Expected: `O[q] = P[q,0]*V[0] + P[q,1]*V[1] + P[q,2]*V[2] + P[q,3]*V[3] + P[q,4]*V[4]`
+- Actual: `O[q] = P[q,0]*V[0] + P[q,1]*V[1] + P[q,2]*V[2] + P[q,3]*V[3]` (missing last term)
+
+### Why seqlen_k <= 4 Passes
+
+When seqlen_k <= 4, all K positions (0 to seqlen_k-1) are contributing. The missing K=4 term is zero anyway (padding).
+
+### Why seqlen_k >= 5 Fails
+
+When seqlen_k >= 5, K position 4 has valid data but is not accumulated, causing incorrect output.
+
+### Root Cause (To Investigate)
+
+Need to determine why K position 4 is not accumulated:
+1. Is P[q,4] correctly computed and distributed?
+2. Is V[4] correctly loaded into the V tile?
+3. Is the GEMM instruction correctly configured?
 
 ---
 
@@ -653,6 +701,22 @@ If you accidentally revert these, the tests will pass because they fall back to 
 ```
 
 Only enable debug prints (`#if 1`) when you specifically need to see the output. After debugging, disable them again before running the full test suite.
+
+---
+
+## WARNING: Print One Lane Per Run
+
+**When printing thread_buffer values, only print 1 lane at a time per run.** Thread buffers can have 128+ elements, and printing multiple lanes simultaneously creates massive output that's hard to parse and may cause issues.
+
+```cpp
+// Good: print one lane
+if(get_lane_id() == 0) { /* print buffer */ }
+
+// Bad: print multiple lanes in one run
+if(get_lane_id() < 32) { /* print buffer */ }  // Too much output!
+```
+
+Change the lane ID between runs to inspect different lanes.
 
 ---
 
