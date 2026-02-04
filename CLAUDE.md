@@ -9,6 +9,7 @@
 2. **During work**:
    - Update `session.md` with progress, hypothesis, and TODO changes
    - Update `issues.md` when issue status or test results change
+   - Update `knowledge.md` when discovering new technical insights (architecture patterns, debugging techniques, non-obvious behaviors)
 
 3. **Before ending** (before compacting is triggered OR user exits conversation):
    - Update `session.md` with latest progress and next steps
