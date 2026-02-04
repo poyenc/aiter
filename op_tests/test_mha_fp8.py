@@ -25,7 +25,6 @@ def attention_fp8_ref_online(
     causal=False,
     window_size=(-1, -1),
     kv_tile_size=64,
-    debug=True,
 ):
     """
     Reference implementation simulating online softmax with KV tiling.
@@ -68,13 +67,6 @@ def attention_fp8_ref_online(
     o_acc = torch.zeros((batch_size, seqlen_q, nheads, d_v), device=q_fp8.device, dtype=torch.float32)
 
     num_kv_tiles = (seqlen_k + kv_tile_size - 1) // kv_tile_size
-
-    if debug:
-        print(f"\n{'='*60}")
-        print(f"[REF] Online softmax simulation: seqlen_q={seqlen_q}, seqlen_k={seqlen_k}, kv_tile_size={kv_tile_size}")
-        print(f"[REF] scale_s={scale_s:.6f}, scale_p={scale_p:.1f}")
-        print(f"[REF] num_kv_tiles={num_kv_tiles}")
-        print(f"{'='*60}")
 
     for tile_idx in range(num_kv_tiles):
         kv_start = tile_idx * kv_tile_size
@@ -144,31 +136,6 @@ def attention_fp8_ref_online(
         # Update m
         m = m_new
 
-        if debug:
-            print(f"\n[REF] Tile {tile_idx}: kv_range=[{kv_start}, {kv_end})")
-            b, h = 0, 0
-
-            # Print row-max details for multiple query rows
-            # Focus on rows at tile boundaries where causal mask changes behavior
-            # Also include row 7 to compare with kernel lane 7
-            query_rows_to_check = [0, 7, 63, 64, 127, 128, 191, 192, 255]
-            query_rows_to_check = [r for r in query_rows_to_check if r < seqlen_q]
-
-            for q_row in query_rows_to_check:
-                # Which KV tokens can this query row attend to?
-                # For causal: q_row can attend to kv indices 0..q_row (when seqlen_q == seqlen_k)
-                max_kv_for_row = q_row + seqlen_k - seqlen_q  # causal boundary
-
-                # Does this tile have any valid (non-masked) tokens for this query row?
-                tile_has_valid = kv_start <= max_kv_for_row
-
-                # Local row max for this tile
-                m_tile_row = scores[b, h, q_row, :].max().item()
-
-                print(f"  [q={q_row:3d}] m_tile={m_tile_row:12.1f}, m_global={m[b,h,q_row].item():12.1f}, "
-                      f"l={l[b,h,q_row].item():10.4f}, alpha={alpha[b,h,q_row].item():.6f}, "
-                      f"valid_in_tile={tile_has_valid}, causal_boundary={max_kv_for_row}")
-
     # Final normalization: O = o_acc / l
     l_for_div = l.permute(0, 2, 1).unsqueeze(-1).clamp(min=1e-9)
     output = o_acc / l_for_div
@@ -176,10 +143,6 @@ def attention_fp8_ref_online(
     # Apply output scale
     scale_o = v_descale / scale_p
     output = (output * scale_o).to(torch.bfloat16)
-
-    if debug:
-        print(f"\n[REF] Final output[0,0,0,:4] = {output[0,0,0,:4].tolist()}")
-        print(f"{'='*60}\n")
 
     return output
 
@@ -369,7 +332,8 @@ def run_ck(
     ],
 )
 def test_flash_attn_output(
-    batch_size, nheads, nheads_k, seqlen_q, seqlen_k, d, d_v, causal, local
+    batch_size, nheads, nheads_k, seqlen_q, seqlen_k, d, d_v, causal, local,
+    kv_tile_size=64,
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
@@ -409,11 +373,17 @@ def test_flash_attn_output(
         k_descale,
         v_descale,
     )
-    out_ref, us_fwd = run_ck(q, k, v, causal, window_size)
+    out_ref = attention_fp8_ref_online(
+        q_quant, k_quant, v_quant,
+        q_descale.item(), k_descale.item(), v_descale.item(),
+        causal=causal,
+        window_size=window_size,
+        kv_tile_size=kv_tile_size,
+    )
 
     max_diff = (out - out_ref).abs().max().item()
     print(f"Output max diff: {max_diff}")
-    assert max_diff < 0.055
+    assert max_diff < 0.01
 
     fwd_flop = (
         batch_size
@@ -421,15 +391,7 @@ def test_flash_attn_output(
         * (seqlen_q * seqlen_k * d * 2 + seqlen_q * seqlen_k * d_v * 2)
     )
 
-    dtype_bytes = torch.finfo(dtype).bits // 8
     quant_dtype_bytes = torch.finfo(quant_dtype).bits // 8
-
-    fwd_num_bytes = (
-        batch_size
-        * nheads
-        * dtype_bytes
-        * (seqlen_q * d + seqlen_k * d + seqlen_k * d_v + seqlen_q * d_v)
-    )
     quant_fwd_num_bytes = (
         batch_size
         * nheads
@@ -440,9 +402,6 @@ def test_flash_attn_output(
     benchmark["quant_fwd_us"] = us_quant_fwd
     benchmark["quant_fwd_tflops"] = (fwd_flop) / 1.0e6 / us_quant_fwd
     benchmark["quant_fwd_gb_per_sec"] = (quant_fwd_num_bytes) / 1.0e3 / us_quant_fwd
-    benchmark["fwd_us"] = us_fwd
-    benchmark["fwd_tflops"] = (fwd_flop) / 1.0e6 / us_fwd
-    benchmark["fwd_gb_per_sec"] = (fwd_num_bytes) / 1.0e3 / us_fwd
 
 
 parser = argparse.ArgumentParser(
