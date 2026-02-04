@@ -48,6 +48,25 @@ Example with seqlen_q=256, seqlen_k=64:
 - Row 196: K[0:5] valid (5 positions: cols 0,1,2,3,4)
 - Row 255: K[0:64] valid (all 64 positions)
 
+**Verification examples from docstrings:**
+
+seqlen_q=2, seqlen_k=5:
+```
+1 1 1 1 0   (row 0: col > 0+5-2=3, mask col 4)
+1 1 1 1 1   (row 1: col > 1+5-2=4, nothing masked)
+```
+
+seqlen_q=5, seqlen_k=2:
+```
+0 0   (row 0: col > 0+2-5=-3, all cols > -3, all masked)
+0 0   (row 1: col > 1+2-5=-2, all masked)
+0 0   (row 2: col > 2+2-5=-1, all masked)
+1 0   (row 3: col > 3+2-5=0, col 1 masked)
+1 1   (row 4: col > 4+2-5=1, nothing masked)
+```
+
+**Kernel dispatch:** Uses `mask_info::decode("b:...")` which sets `mask_enum::mask_bottom_right`.
+
 ---
 
 ## sp_compute Buffer Roles
@@ -192,6 +211,33 @@ return i_x >= x_end || i_y >= y_total;
 | Multiple KV tile iterations | `attention_fp8_ref_online()` | Online softmax (tile-by-tile) |
 
 Both references are in `op_tests/test_mha_fp8.py`.
+
+---
+
+## Reference Implementation Verification
+
+**Verification script:** `op_tests/verify_reference.py`
+
+Compares three implementations:
+1. `attention_fp8_ref_online()` - online softmax with KV tiling (kv_tile_size=64)
+2. `attention_fp8_ref()` - batch softmax (full sequence at once)
+3. `aiter.flash_attn_func` - BF16 production kernel
+
+**Key findings:**
+
+| Configuration | Online vs Batch Diff | Notes |
+|---------------|---------------------|-------|
+| Single KV tile (k ≤ 64) | 0.000 | Identical results |
+| Multiple KV tiles (k > 64) | 0.007-0.012 | Expected difference |
+
+**Why the difference for multiple tiles:**
+- Online softmax quantizes P to FP8 **per-tile** using a running max
+- Batch softmax quantizes P using a **single global max**
+- Different FP8 representations for logically equivalent attention weights
+
+**Tolerance:** Tests use 0.02 tolerance to accommodate:
+- FP8 quantization differences between online/batch softmax
+- Numerical variance in online softmax accumulation
 
 ---
 
