@@ -56,8 +56,8 @@ rm -f aiter/jit/*.so && python -m pytest op_tests/test_mha_fp8.py -v
 
 ## Best Practices
 
-- **Print all values:** When comparing kernel registers with reference, print all thread_buffer values, not just the first few. Matching on a few elements doesn't mean all match. Do this by hardcoding the lane ID and repeating the cycle (update lane ID → run test → collect output) until you have enough data to compare. 
-- **Verify completely before moving on:** When debugging intermediate values (sp_compute, m, l, P, V, o_acc), verify ALL rows/cols before concluding correctness. Ask the user to confirm findings before proceeding to the next stage.
+- **Print all values:** When comparing kernel registers with reference, print all thread_buffer values, not just the first few. Matching on a few elements doesn't mean all match. Do this by hardcoding the lane ID and repeating the cycle (update lane ID → run test → collect output) until you have enough data to compare.
+- **Verify and confirm before moving on:** When debugging intermediate values (sp_compute, m, l, P, V, o_acc), verify ALL rows/cols before concluding correctness. Before moving to verify the next stage's intermediate values, always ask the user if the current conclusion is correct. Do not proceed without explicit user confirmation.
 - **Ask user for direction:** Before moving to the next debugging step, present options to the user and let them decide the direction. Do not assume what to check next.
 - **Batch kernel changes:** Debug prints require expensive recompilation. Plan all changes at once rather than incrementally.
 - **Only record verified facts:** Do not write conclusions or hypotheses in this document until they are verified by experiments. Record experiment results and observations, not speculation.
