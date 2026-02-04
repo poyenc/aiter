@@ -45,7 +45,6 @@ rm -f aiter/jit/*.so && python -m pytest op_tests/test_mha_fp8.py -v
 - [Session Notes](.claude/session.md) - Current focus, next steps, and TODO
 - [Issue Tracker](.claude/issues.md) - Issue status, reproduction steps, and test results
 - [Technical Knowledge](.claude/knowledge.md) - Pipeline design, lane mapping, and debugging insights
-- [FP8 Attention Notes](op_tests/FP8_ATTENTION_NOTES.md) - FP8 attention kernel behavior and reference implementation details
 
 ## Project Structure
 
