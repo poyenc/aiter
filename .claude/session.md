@@ -1,32 +1,36 @@
 # FP8 FMHA v3 Debug Session
 
-**Last Updated:** 2026-02-05
+**Last Updated:** 2026-02-06
 
 ---
 
 ## Current Status
 
-**FIXED** - FP8 FMHA v3 pipeline now produces correct outputs.
+**FIXED** - All FP8 FMHA v3 issues resolved.
+
+**Test Results:** Full pytest suite: **176/176 tests pass**
+
+---
+
+## Recent Work: FP8 Code Sinking Fix (2026-02-06)
+
+Fixed Issue #5: FP8 P conversion code was being sunk by compiler to between Phase 1 and Phase 2.
+
+**Fix:** Added `asm volatile` wrapper `detail::cvt_pk_fp8_f32()` for FP8 conversion, matching the pattern used by BF16/FP16.
+
+**Key insight:** Only the final `v_cvt_pk_fp8_f32` instruction needs the `asm volatile` wrapper. All predecessor instructions (scale, etc.) automatically stay in Phase 0 because their results feed into the anchored conversion.
+
+**File:** `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_fwd_v3_pipeline.hpp`
+
+**Assembly verification:** FP8 conversions now in Phase 0 (lines 889-969 inside phase0 marker).
+
+---
+
+## Previous Work: P/V Distribution Fix (2026-02-04)
 
 **Root Cause:** P/V lane distribution mismatch in PV GEMM. Lane 32 had P[K=4] but V was all zeros.
 
 **Fix:** Changed QK GEMM warp gemm from `WarpGemmMfma_f32_32x32x32_fp8_fp8_CTransposed<>{}` to `WarpGemmMfmaFp8Fp8F32M32N32K32SwizzleBTransposedCDistribution<>{}`. The SwizzleB variant provides 8 contiguous K positions per lane (vs 4), aligning P (sp_compute) distribution with V tile distribution.
-
-**Test Results:**
-- Minimal reproducer (q=1, k=5): Output max diff = 0.0
-- Full pytest suite: **176/176 tests pass**
-
----
-
-## Recent Work: Assembly Analysis (2026-02-05)
-
-Analyzed FP8 vs BF16 V3 kernel assembly to understand phase structure and potential optimizations.
-
-**Key Finding:** FP8 kernel has P→FP8 conversion code located between Phase 1 and Phase 2 (outside phase markers), while BF16 has P→BF16 conversion inside Phase 0. This means:
-- FP8: P conversion runs **after** ds_read completes, no overlap with memory latency
-- BF16: P conversion overlaps with MFMA latency in Phase 0
-
-**Potential Optimization:** Move FP8 P conversion to Phase 0 (like BF16) to improve instruction overlap.
 
 See [knowledge.md](knowledge.md) for detailed assembly analysis.
 
