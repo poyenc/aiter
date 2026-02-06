@@ -61,6 +61,8 @@ rm -f aiter/jit/*.so && python -m pytest op_tests/test_mha_fp8.py -v
 - **Ask user for direction:** Before moving to the next debugging step, present options to the user and let them decide the direction. Do not assume what to check next.
 - **Batch kernel changes:** Debug prints require expensive recompilation. Plan all changes at once rather than incrementally.
 - **Only record verified facts:** Do not write conclusions or hypotheses in this document until they are verified by experiments. Record experiment results and observations, not speculation.
+- **Copy exact strings when editing:** When using the Edit tool, copy the exact string from the Read output rather than reconstructing it from memory or diff output. Escaped characters (like `\"`) and whitespace must match exactly.
+- **Avoid cd to subdirectories:** Do not use `cd` to change into subdirectories in Bash commands. The working directory persists between commands, so subsequent commands will fail if they assume the initial working directory. Use absolute paths or run commands with `docker exec ... bash -c "cd /path && command"` instead.
 
 ## JIT Compilation Mechanism
 
