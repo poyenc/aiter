@@ -46,20 +46,33 @@ rm -f aiter/jit/*.so && python -m pytest op_tests/test_mha_fp8.py -v
 
 ### Profiling with rocprofv3
 
-**Notice:** Before running profiling, make sure the command only launches the same kernel repeatedly with the same workload.
+**Notice:** Before running profiling, make sure the command only launches the same kernel repeatedly with the same workload. Use the `-p` (profile) flag to run the kernel without warmup iterations.
 
 ```bash
 # Inside container: Profile a command using rocprofv3 with config file
-rocprofv3 -i ~/input_att.yaml -- python op_tests/test_mha_fp8.py
+# Use -p for profile mode (no warmup), specify workload with -b, -n, -q options
+rocprofv3 -i ~/input_att.yaml -- python op_tests/test_mha_fp8.py -b 1 -n 16 -q 8192 -p
 
 # Inside container: Remove old results before next profiling run to avoid mixing old/new data
 rm -rf ck_test/*
 ```
 
+**test_mha_fp8.py options:**
+- `-b, --batch_size`: Batch size (default: 2)
+- `-n, --nheads`: Number of heads (default: 5)
+- `-nk, --nheads_k`: Number of KV heads, -1 means equal to nheads (default: -1)
+- `-q, --seqlen_q`: Query sequence length (default: 512)
+- `-k, --seqlen_k`: Key sequence length, -1 means equal to seqlen_q (default: -1)
+- `-d, --d_qk`: Head dimension (default: 128)
+- `-dv, --d_v`: Value head dimension, -1 means equal to d_qk (default: -1)
+- `-c, --causal`: Enable causal attention
+- `-l, --local`: Enable local attention
+- `-p, --profile`: Profile mode (101 iterations, 2 warmup, for rocprofv3)
+
 ```bash
 # Outside container: Backup thread trace file (last one with shader_engine_1_*.att suffix)
 mkdir -p <WORKSPACE>/backup/$(date +%y%m%d)
-cp $(ls ck_test/pass_1/*shader_engine_1*.att | sort | tail -1) <WORKSPACE>/backup/$(date +%y%m%d)/<name>.att
+cp $(ls ck_test/pass_1/*shader_engine_1*.att | sort | tail -1) <WORKSPACE>/backup/$(date +%y%m%d)/<name>_$(TZ='Asia/Taipei' date +'%H%M%S').att
 ```
 
 **Thread trace files:** There are several `.att` thread trace files under `ck_test/` with similar names. Backup the last one (lexicographic order) with `shader_engine_1_*.att` suffix after each run.
