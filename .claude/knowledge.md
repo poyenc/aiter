@@ -446,3 +446,259 @@ aiter/jit/build/mha_fwd_bf16_*/build/*v3*gfx950.s      # BF16 kernel
 ```
 
 Enable `--save-temps` in optCompilerConfig.json to generate `.s` files.
+
+---
+
+## V3 Pipeline Instruction Scheduler Design
+
+The FMHA V3 pipeline uses AMD's `__builtin_amdgcn_sched_group_barrier()` intrinsic for **explicit instruction scheduling control**. This maximizes GPU utilization by precisely overlapping computation with memory operations.
+
+**Source:** `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_fwd_v3_pipeline.hpp`
+
+### The `sched_group_barrier` Intrinsic
+
+```cpp
+__builtin_amdgcn_sched_group_barrier(uint32_t mask, uint32_t count, uint32_t flags);
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `mask` | Bitmask selecting instruction group (MFMA, VMEM, LDS, VALU, SALU) |
+| `count` | Number of instructions of that type to schedule before proceeding |
+| `flags` | Reserved (always 0) |
+
+**Scheduler Group Masks** (from `ck/utility/blkgemmpipe_scheduler.hpp`):
+
+| Mask | Name | Description |
+|------|------|-------------|
+| `0x002` | VALU | Vector ALU operations |
+| `0x004` | SALU | Scalar ALU operations |
+| `0x008` | SCHED_GROUP_MFMA | Matrix FMA (MFMA) instructions |
+| `0x020` | SCHED_GROUP_VMEM | Global memory operations |
+| `0x100` | SCHED_GROUP_LDS_READ | LDS read operations |
+| `0x200` | SCHED_GROUP_LDS_WRITE / TRANS | LDS write / transpose operations |
+
+### Two Warp Group Architecture
+
+The V3 pipeline divides the thread block (512 threads = 8 waves) into **two warp groups**:
+
+```cpp
+const index_t warp_group_id = get_warp_id() / 4;  // line 480
+```
+
+| Warp Group | Waves | Role |
+|------------|-------|------|
+| 0 | 0-3 | Executes `core_loop(number<0>{})` |
+| 1 | 4-7 | Executes `core_loop(number<1>{})` |
+
+They run different code paths with **asymmetric scheduling** (lines 1256-1272):
+
+```cpp
+if(warp_group_id == 0) {
+    __builtin_amdgcn_s_setprio(0);  // Lower priority
+    while(core_loop(number<0>{}));
+}
+if(warp_group_id != 0) {
+    __builtin_amdgcn_s_setprio(1);  // Higher priority
+    while(core_loop(number<1>{}));
+}
+```
+
+### Four-Phase Execution Model
+
+Each iteration consists of 4 phases. The `CoreLoopScheduler` template (lines 40-189) defines the scheduling pattern for each (WarpGroup, Phase) combination:
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                     Phase Timeline (One Iteration)                            │
+├──────────┬──────────┬──────────┬──────────┬──────────┬──────────┬───────────┤
+│          │ Phase 0  │ Phase 1  │ Phase 2  │ Phase 3  │ Phase 0  │    ...    │
+├──────────┼──────────┼──────────┼──────────┼──────────┼──────────┼───────────┤
+│WarpGrp 0 │ GEMM0    │ Load K   │ GEMM1    │ Load V   │ GEMM0    │    ...    │
+│          │ +softmax │ +mask    │ +scale   │          │ +softmax │           │
+├──────────┼──────────┼──────────┼──────────┼──────────┼──────────┼───────────┤
+│WarpGrp 1 │ Load V   │ GEMM0    │ Load K   │ GEMM1    │ Load V   │    ...    │
+│          │          │ +softmax │ +mask    │ +scale   │          │           │
+└──────────┴──────────┴──────────┴──────────┴──────────┴──────────┴───────────┘
+```
+
+This **ping-pong pattern** ensures:
+- While WarpGroup 0 computes GEMM0 (Q×K), WarpGroup 1 loads data
+- While WarpGroup 1 computes GEMM1 (P×V), WarpGroup 0 loads data
+
+### Scheduler Patterns per Phase
+
+**WarpGroup 0 Scheduling** (lines 52-81):
+
+| Phase | Barrier Sequence | Purpose |
+|-------|------------------|---------|
+| 0 | `8 × (MFMA:1, TRANS:2, VALU:2)` | GEMM0: 8 MFMA + 16 transpose + 16 VALU |
+| 1 | `VALU:2, SALU:4` | Light work during K load |
+| 2 | `VALU:4` (if packed), `8 × (MFMA:1, VALU:4)` | GEMM1: 8 MFMA + 32 VALU |
+| 3 | `VALU:2, SALU:4` | Light work during V load |
+
+**WarpGroup 1 Scheduling** (lines 83-114):
+
+| Phase | Barrier Sequence | Purpose |
+|-------|------------------|---------|
+| 0 | `VALU:2, SALU:4` | Light work during V load |
+| 1 | `8 × (MFMA:1, TRANS:2, VALU:2)` | GEMM0: 8 MFMA + 16 transpose + 16 VALU |
+| 2 | `VALU:2, SALU:4` | Light work during K load |
+| 3 | `VALU:4` (if packed), `8 × (MFMA:1, VALU:4)` | GEMM1: 8 MFMA + 32 VALU |
+
+### The 8-MFMA Pattern
+
+The core compute phases (Phase 0 for WG0, Phase 1 for WG1) use this pattern:
+
+```cpp
+// lines 56-60, 72-75, 92-96, 108-111
+static_for<0, 8, 1>{}([&](auto) {
+    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // 1 MFMA
+    __builtin_amdgcn_sched_group_barrier(0x200, 2, 0); // 2 TRANS/LDS writes
+    __builtin_amdgcn_sched_group_barrier(0x002, 2, 0); // 2 VALU
+});
+```
+
+This pattern issues per iteration:
+- **1 MFMA** instruction (32-cycle latency on GFX950)
+- **2 TRANS** operations (interleaved with MFMA to hide latency)
+- **2 VALU** operations (softmax/scale computations)
+
+Total per GEMM: 8 MFMA × (1 + 2 + 2) = **40 barrier groups**
+
+### Phase Boundary Markers
+
+```cpp
+// lines 12-20
+#define ASM_MARKER(marker)               \
+    __builtin_amdgcn_sched_barrier(0);   \
+    asm volatile("; [POYENC] " #marker); \
+    __builtin_amdgcn_sched_barrier(0);
+```
+
+These serve two purposes:
+1. **Prevent code sinking**: Compiler cannot move instructions across `asm volatile`
+2. **Debug markers**: Comments appear in disassembly for profiling
+
+### Phase Implementation in Core Loop
+
+**Phase 0 (WarpGroup 0) - GEMM0 + Softmax:**
+```cpp
+// lines 1057-1074
+__builtin_amdgcn_sched_barrier(0);
+s_waitcnt_lgkmcnt<0>();              // Wait for LDS operations
+__builtin_amdgcn_sched_barrier(0);
+cl_calc(xdl_SP_p01_reg_idx, gemm0);  // GEMM0: Q × K^T
+fmha_alu1(xdl_SP_p23_reg_idx);       // Softmax exp + rowsum
+fmha_logits_trans(xdl_SP_p01_reg_idx);
+
+Scheduler::schedule(cl_p, number<0>{});  // Emit scheduling barriers
+__builtin_amdgcn_sched_barrier(0);       // Force barrier boundary
+```
+
+**Phase 1 (WarpGroup 0) - Load K:**
+```cpp
+// lines 1076-1083
+s_waitcnt_vmcnt<K_mem_su_ld_insts + V_mem_su_ld_insts>();  // Wait for DMA
+__builtin_amdgcn_s_barrier();                              // Workgroup sync
+cl_load(memK, K_w0_lds_wr_idx, V_w0_lds_rd_idx);           // Async K load + V LDS read
+Scheduler::schedule(cl_p, number<1>{});
+fmha_mask(xdl_SP_p01_reg_idx);                             // Apply attention mask
+```
+
+**Phase 2 (WarpGroup 0) - GEMM1:**
+```cpp
+// lines 1087-1098
+s_waitcnt_lgkmcnt<0>();              // Wait for LDS
+__builtin_amdgcn_s_barrier();        // Sync
+cl_calc(xdl_SP_p23_reg_idx, gemm1);  // GEMM1: P × V
+
+Scheduler::schedule(cl_p, number<2>{});
+fmha_alu_D_upd();                    // Rescale O accumulator
+```
+
+**Phase 3 (WarpGroup 0) - Load V:**
+```cpp
+// lines 1100-1109
+s_waitcnt_vmcnt<K_mem_su_ld_insts + V_mem_su_ld_insts>();
+__builtin_amdgcn_s_barrier();
+cl_load(memV, V_w0_lds_wr_idx, K_w0_lds_rd_idx);  // Async V load + K LDS read
+
+Scheduler::schedule(cl_p, number<3>{});
+kv_token_start += kN0;  // Move to next token
+```
+
+### Pipeline Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Iteration N                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─── Phase 0 ───┐  ┌─── Phase 1 ───┐  ┌─── Phase 2 ───┐  ┌─── Phase 3 ───┐ │
+│  │               │  │               │  │               │  │               │ │
+│  │   WG0: GEMM0  │  │   WG0: Load K │  │   WG0: GEMM1  │  │   WG0: Load V │ │
+│  │   8×MFMA      │  │   async_load  │  │   8×MFMA      │  │   async_load  │ │
+│  │   softmax     │  │   s_barrier   │  │   rescale O   │  │   s_barrier   │ │
+│  │               │  │   fmha_mask   │  │               │  │               │ │
+│  ├───────────────┤  ├───────────────┤  ├───────────────┤  ├───────────────┤ │
+│  │               │  │               │  │               │  │               │ │
+│  │   WG1: Load V │  │   WG1: GEMM0  │  │   WG1: Load K │  │   WG1: GEMM1  │ │
+│  │   async_load  │  │   8×MFMA      │  │   async_load  │  │   8×MFMA      │ │
+│  │               │  │   softmax     │  │   fmha_mask   │  │   rescale O   │ │
+│  │               │  │               │  │               │  │               │ │
+│  └───────────────┘  └───────────────┘  └───────────────┘  └───────────────┘ │
+│                                                                              │
+│  ◄───sched_barrier───►◄───sched_barrier───►◄───sched_barrier───►           │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Packed FP32 Support
+
+When using packed FP32 operations (`v_pk_mul_f32`), additional VALU slots are needed:
+
+```cpp
+// lines 69-71, 105-107
+#if !CK_TILE_DISABLE_PACKED_FP32
+    __builtin_amdgcn_sched_group_barrier(0x002, 4, 0); // Extra 4 VALU for v_pk_mul_f32
+#endif
+```
+
+### Inline Assembly Wrappers
+
+The file defines custom asm wrappers (lines 192-261) to prevent code motion:
+
+| Function | Purpose |
+|----------|---------|
+| `fma_impl_vsv()` | FMA with scalar operand |
+| `cvt_pk_fp8_f32()` | FP8 packing (prevents sinking) |
+| `cvt_pk_bf16_f32()` | BF16 packing |
+| `pk_mul_f32()` | Packed FP32 multiply |
+
+### Performance Optimization Rationale
+
+1. **Hide MFMA Latency**: MFMA takes ~32 cycles; interleaving with TRANS/VALU keeps matrix cores busy
+
+2. **Overlap Memory and Compute**: While one warp group computes, the other loads next tiles
+
+3. **Explicit Scheduling**: Without `sched_group_barrier`, the compiler might:
+   - Issue all MFMAs together (causing pipeline stalls)
+   - Move loads too late (causing memory latency exposure)
+   - Reorder softmax ops (breaking dependencies)
+
+4. **Priority Control**: `s_setprio(1)` for WarpGroup 1 ensures its compute phases aren't starved by WarpGroup 0's memory operations
+
+### CoreLoopScheduler Template
+
+```cpp
+// lines 40-189
+template <typename PipelineProblem, bool kIsMasking>
+struct CoreLoopScheduler;
+```
+
+Two variants exist:
+- `CoreLoopScheduler<..., true>` - With masking support (causal attention)
+- `CoreLoopScheduler<..., false>` - Without masking
+
+Both have identical scheduling patterns (masking is handled separately via `fmha_mask()`).
