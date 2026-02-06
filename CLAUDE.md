@@ -15,6 +15,9 @@
    - Update `session.md` with latest progress and next steps
    - Commit `.claude/*.md` files with a summary of progress
 
+4. **File backup convention**:
+   - The user tends to move interesting files into `<WORKSPACE>/backup/$(date +%y%m%d)/` folder
+
 ## Build and Run Environment
 
 User-specific settings are in `.claude/user.md` (see `.claude/user.md.example` for template).
@@ -40,6 +43,23 @@ rm aiter/jit/*.so
 # Inside container
 rm -f aiter/jit/*.so && python -m pytest op_tests/test_mha_fp8.py -v
 ```
+
+### Profiling with rocprofv3
+
+**Notice:** Before running profiling, make sure the command only launches the same kernel repeatedly with the same workload.
+
+```bash
+# Profile a command using rocprofv3 with config file
+rocprofv3 -i ~/input_att.yaml -- python op_tests/test_mha_fp8.py
+
+# Backup thread trace file (last one with shader_engine_1_*.att suffix)
+cp $(ls ck_test/*/shader_engine_1_*.att | sort | tail -1) <WORKSPACE>/backup/$(date +%y%m%d)/
+
+# IMPORTANT: Remove old results before next profiling run to avoid mixing old/new data
+rm -rf ck_test/*
+```
+
+**Thread trace files:** There are several `.att` thread trace files under `ck_test/` with similar names. Backup the last one (lexicographic order) with `shader_engine_1_*.att` suffix after each run.
 
 ## Technical Documentation
 
