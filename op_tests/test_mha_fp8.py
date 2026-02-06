@@ -5,7 +5,7 @@ import math
 import torch
 import aiter
 from aiter import dtypes
-from aiter.test_common import run_perftest
+from aiter.test_common import run_perftest, perftest
 from aiter import per_tensor_quant
 from einops import repeat
 import pytest
@@ -261,6 +261,11 @@ def attention_fp8_ref(
     return output
 
 
+@perftest()
+def profile_func(target_func, *args, **kwargs):
+    return target_func(*args, **kwargs)
+
+
 def run_ck(
     q,
     k,
@@ -270,8 +275,15 @@ def run_ck(
     q_descale=None,
     k_descale=None,
     v_descale=None,
+    profile=False,
 ):
     if q.dtype == dtypes.fp8 and k.dtype == dtypes.fp8 and v.dtype == dtypes.fp8:
+        if profile:
+            return profile_func(
+                aiter.flash_attn_fp8_pertensor_func,
+                q, k, v, q_descale, k_descale, v_descale,
+                causal=causal, window_size=window_size,
+            )
         return run_perftest(
             aiter.flash_attn_fp8_pertensor_func,
             q,
@@ -286,6 +298,13 @@ def run_ck(
             num_warmup=0,
         )
     else:
+        if profile:
+            return profile_func(
+                aiter.flash_attn_func,
+                q, k, v, dropout_p=0.0, causal=causal, window_size=window_size,
+                bias=None, alibi_slopes=None, deterministic=True,
+                return_lse=False, return_attn_probs=False,
+            )
         return run_perftest(
             aiter.flash_attn_func,
             q,
@@ -334,6 +353,7 @@ def run_ck(
 def test_flash_attn_output(
     batch_size, nheads, nheads_k, seqlen_q, seqlen_k, d, d_v, causal, local,
     kv_tile_size=64,
+    profile=False,
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
@@ -372,7 +392,9 @@ def test_flash_attn_output(
         q_descale,
         k_descale,
         v_descale,
+        profile=profile,
     )
+
     out_ref = attention_fp8_ref_online(
         q_quant, k_quant, v_quant,
         q_descale.item(), k_descale.item(), v_descale.item(),
@@ -478,6 +500,13 @@ parser.add_argument(
     help="""Local attention. Default is False.
     -l or --local    # enable local attention""",
 )
+parser.add_argument(
+    "-p",
+    "--profile",
+    action="store_true",
+    help="""Profile mode: run kernel without warmup for profiling.
+    -p or --profile    # enable profile mode""",
+)
 
 if __name__ == "__main__":
     args = parser.parse_args()
@@ -486,7 +515,6 @@ if __name__ == "__main__":
     seqlen_k = args.seqlen_k if args.seqlen_k > 0 else args.seqlen_q
     d_v = args.d_v if args.d_v > 0 else args.d_qk
 
-    collected = []
     test_flash_attn_output(
         args.batch_size,
         args.nheads,
@@ -497,8 +525,8 @@ if __name__ == "__main__":
         d_v,
         args.causal,
         args.local,
+        profile=args.profile,
     )
-    collected.append(benchmark)
 
-    df = pd.DataFrame(collected)
+    df = pd.DataFrame([benchmark])
     aiter.logger.info(f"mha summary:\n{df}")
