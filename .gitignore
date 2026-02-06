@@ -57,6 +57,11 @@ aiter_logs
 aiter_meta
 aiter/install_mode
 
+# profiler
+ .rocprofv3/
+ck_test/
+pass_2/
+
 # AI agent config (keep .claude/*.md for documentation)
 .claude/*
 !.claude/user.md.example
