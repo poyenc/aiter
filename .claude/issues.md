@@ -8,6 +8,7 @@
 | #2 | [PV GEMM Missing K Positions](#issue-2-pv-gemm-missing-k-positions) | ✓ FIXED | seqlen_k % 16 in [5,11] | P/V lane distribution mismatch |
 | #3 | [Causal Masking Bug](#issue-3-causal-masking-bug) | ✓ FIXED | seqlen_k≥256 with causal=True | Same as #2 |
 | #4 | [V Tile Transpose Load Bug](#issue-4-v-tile-transpose-load-bug) | ⚠️ BYPASSED | FP8 V tile loading | Coordinate mismatch |
+| #5 | [FP8 P Conversion Code Sinking](#issue-5-fp8-p-conversion-code-sinking) | 🔍 IDENTIFIED | FP8 performance | Missing asm volatile wrapper |
 
 > **Note:** Replace `<CONTAINER>` and `<WORKSPACE>` with values from `.claude/user.md`
 
@@ -137,6 +138,78 @@ This issue was initially investigated as the root cause of the 8-lane offset bug
 
 ### Related
 - May be related to Issue #2 (P/V distribution mismatch)
+
+---
+
+## Issue #5: FP8 P Conversion Code Sinking
+
+### Status: 🔍 IDENTIFIED (2026-02-05)
+
+### Description
+FP8 kernel has P→FP8 conversion code located between Phase 1 and Phase 2, while BF16 kernel has P→BF16 conversion in Phase 0. This means FP8 P conversion doesn't overlap with MFMA latency, potentially hurting performance.
+
+### Root Cause
+
+Compiler "code sinking" optimization moves P conversion close to where P is consumed (Phase 2 MFMA).
+
+**BF16/FP16:** Uses `asm volatile` wrappers to prevent sinking:
+```cpp
+// block_fmha_fwd_v3_pipeline.hpp:857-862
+auto casted = detail::cvt_pk_bf16_f32(x, y);  // asm volatile inside
+```
+
+**FP8:** Uses regular `type_convert<fp8_t>()` without `asm volatile` protection:
+```cpp
+// block_fmha_fwd_v3_pipeline.hpp:863-867
+sp(sp_reg_idx).p.thread_buf_[idx] = type_convert<PDataType>(x);
+```
+
+The source code comment (lines 843-846) explicitly documents this issue:
+```cpp
+/// Note: The compiler keeps sinking the conversion instructions because the
+/// result 'p' is only consumed later. To anchor them here, we rewrite
+/// the cast_tile() call as inline assembly, forcing the conversions to be
+/// emitted at this point.
+```
+
+### Assembly Evidence
+
+**BF16 Phase 0 (inside phase marker):**
+```asm
+v_cvt_pk_bf16_f32 v118, v143, v145   ; 8× conversions in Phase 0
+```
+
+**FP8 (between Phase 1 and Phase 2, outside markers):**
+```asm
+v_mul_f32_e32 v217, v150, v217       ; Scale by p_scale
+v_med3_f32 v252, v217, s28, v251     ; Clamp to FP8 range
+v_cmp_nlg_f32_e64 vcc, |v217|, s21   ; NaN/Inf check
+v_cndmask_b32_e32 v217, v252, v217
+v_cvt_pk_fp8_f32 v252, v217, v217    ; 32× conversions between phases
+```
+
+### Proposed Fix
+
+Add `asm volatile` wrapper for FP8 conversion similar to BF16:
+```cpp
+CK_TILE_DEVICE fp8x2_t cvt_pk_fp8_f32(float a, float b)
+{
+    fp8x2_t result;
+    asm volatile("v_cvt_pk_fp8_f32 %[result], %[a], %[b]"
+                 : [result] "=v"(result)
+                 : [a] "v"(a), [b] "v"(b));
+    return result;
+}
+```
+
+Note: FP8 also requires scale, saturate, and NaN-check operations before conversion, which would also need inline asm protection to prevent sinking.
+
+### Impact
+- **Correctness:** Not affected (kernel produces correct results)
+- **Performance:** Potential suboptimal instruction scheduling
+
+### Related
+- See [knowledge.md](knowledge.md) for detailed assembly analysis
 
 ---
 

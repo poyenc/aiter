@@ -377,14 +377,66 @@ v_mfma_f32_32x32x16_fp8_fp8 v[34:49], v[144:145], v[202:203], v[34:49]
 ;                                     ^^^^^^^^^ V   ^^^^^^^^^ P (FP8)
 ```
 
-### Potential Optimization
+### Root Cause: Compiler Code Sinking
 
-The FP8 P→FP8 conversion sitting between Phase 1 and Phase 2 means:
-1. **No overlap with Phase 1 memory latency** - conversion runs after ds_read completes
-2. **Not covered by scheduling hints** - outside phase markers
-3. **BF16 is better optimized** - P→BF16 in Phase 0 overlaps with MFMA latency
+The compiler optimization called "code sinking" moves data preparation code closer to where the data is consumed. This hurts GPU kernel performance because we want to overlap computation with memory latency.
 
-Possible improvement: Move FP8 P conversion into Phase 0 (like BF16) to overlap with QK MFMA.
+**Source code comment (block_fmha_fwd_v3_pipeline.hpp:843-846):**
+```cpp
+/// Note: The compiler keeps sinking the conversion instructions because the
+/// result 'p' is only consumed later. To anchor them here, we rewrite
+/// the cast_tile() call as inline assembly, forcing the conversions to be
+/// emitted at this point.
+```
+
+**BF16/FP16: Uses inline asm to prevent sinking**
+```cpp
+// Lines 857-862: BF16 uses asm volatile wrapper
+auto casted = detail::cvt_pk_bf16_f32(x, y);  // asm volatile inside
+
+// The wrapper function (lines 232-239):
+CK_TILE_DEVICE bf16x2_t cvt_pk_bf16_f32(float a, float b)
+{
+    bf16x2_t result;
+    asm volatile("v_cvt_pk_bf16_f32 %[result], %[a], %[b]"
+                 : [result] "=v"(result)
+                 : [a] "v"(a), [b] "v"(b));
+    return result;
+}
+```
+
+**FP8: Uses regular type_convert (NO inline asm protection)**
+```cpp
+// Lines 863-867: FP8 uses regular conversion
+else if constexpr(std::is_same_v<PDataType, fp8_t>)
+{
+    sp(sp_reg_idx).p.thread_buf_[idx]     = type_convert<PDataType>(x);
+    sp(sp_reg_idx).p.thread_buf_[idx + 1] = type_convert<PDataType>(y);
+}
+```
+
+### Why FP8 P Conversion Gets Sunk
+
+1. `type_convert<fp8_t>()` is NOT wrapped in `asm volatile`
+2. Compiler sees P is only consumed in Phase 2's MFMA
+3. Compiler sinks the conversion to be close to Phase 2
+4. Result: P→FP8 conversion ends up between Phase 1 and Phase 2
+
+### Fix: Add Inline ASM Wrapper for FP8
+
+To prevent sinking, FP8 needs an `asm volatile` wrapper similar to BF16:
+```cpp
+CK_TILE_DEVICE fp8x2_t cvt_pk_fp8_f32(float a, float b)
+{
+    fp8x2_t result;
+    asm volatile("v_cvt_pk_fp8_f32 %[result], %[a], %[b]"
+                 : [result] "=v"(result)
+                 : [a] "v"(a), [b] "v"(b));
+    return result;
+}
+```
+
+Note: FP8 also requires additional operations (scale, saturate, NaN check) before conversion, which would also need inline asm protection.
 
 ### Assembly File Locations
 
