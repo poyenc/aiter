@@ -290,3 +290,107 @@ return WarpGemmMfmaFp8Fp8F32M32N32K32SwizzleBTransposedCDistribution<>{};
 | Block GEMM | `3rdparty/composable_kernel/include/ck_tile/ops/gemm/block/block_gemm_areg_breg_creg_v2.hpp` |
 | Test | `op_tests/test_mha_fp8.py` |
 | Debug Script | `op_tests/debug_mha_fp8.py` |
+
+---
+
+## V3 Kernel Assembly Analysis (FP8 vs BF16)
+
+### Kernel Metadata Comparison
+
+| Property | FP8 (fp8bf16) | BF16 |
+|----------|---------------|------|
+| Tile size | 256×64×128 (M×N×K) | 256×32×128 |
+| VGPRs | 256 | 256 |
+| SGPRs | 91 | ~90 |
+| LDS | 51,200 bytes | ~51,200 bytes |
+| Occupancy | 2 waves/CU | 2 waves/CU |
+| MFMA count | 176 | 88 |
+| MFMA instruction | `v_mfma_f32_32x32x16_fp8_fp8` | `v_mfma_f32_32x32x16_bf16` |
+
+### Phase Structure (4 Phases per Iteration)
+
+Both FP8 and BF16 V3 kernels use the same phase structure with warp group specialization (Wave0-3 and Wave4-7):
+
+| Phase | Purpose | Key Operations |
+|-------|---------|----------------|
+| Phase 0 | S = Q × K^T + softmax | MFMA (QK), v_exp_f32, v_add_f32, v_permlane32_swap |
+| Phase 1 | Memory load (next K/V) | buffer_load to LDS, ds_read_b64_tr (transpose read) |
+| Phase 2 | O += P × V | MFMA (PV), v_max3_f32, v_fma_f32 |
+| Phase 3 | Memory load (prep) | buffer_load, ds_read for next iteration |
+
+### P Conversion Location Difference (Potential Optimization Issue)
+
+**BF16 V3:** P→BF16 conversion happens **in Phase 0** after exp():
+```asm
+; Phase 0 (line ~773-795)
+v_exp_f32_e32 v143, v165
+v_add_f32_e32 v147, v145, v143
+...
+v_cvt_pk_bf16_f32 v118, v143, v145   ; 8× conversions in Phase 0
+v_cvt_pk_bf16_f32 v119, v146, v138
+; Phase 1 starts
+```
+
+**FP8 V3:** P→FP8 conversion happens **between Phase 1 and Phase 2** (outside phase markers):
+```asm
+; Phase 1 (line 921)
+buffer_load_dwordx4 ... lds
+ds_read_b64_tr_b8 ...              ; 16× LDS reads
+; Boundary check (v_cmp, v_cndmask)
+; .LBB0_24:
+v_mul_f32_e32 v217, v150, v217     ; Scale by p_scale
+v_med3_f32 v252, v217, s28, v251   ; Clamp to FP8 range
+v_cmp_nlg_f32_e64 vcc, |v217|, s21 ; NaN/Inf check
+v_cndmask_b32_e32 v217, v252, v217
+v_cvt_pk_fp8_f32 v252, v217, v217  ; 32× conversions between phases
+...
+; Phase 2 (line 1319)
+```
+
+### FP8 Quantization Extra Operations
+
+FP8 P conversion requires additional operations vs BF16:
+
+| Step | FP8 | BF16 |
+|------|-----|------|
+| Scale | `v_mul_f32` (apply p_scale) | None |
+| Saturate | `v_med3_f32` (clamp to FP8 range) | None |
+| NaN check | `v_cmp_nlg_f32` + `v_cndmask_b32` | None |
+| Convert | `v_cvt_pk_fp8_f32` | `v_cvt_pk_bf16_f32` |
+| Count | 32 conversions | 8 conversions |
+
+### Phase 2 Data Flow (P×V MFMA)
+
+Phase 2 uses the P conversion results:
+
+```asm
+; Phase 2: Pack FP8 P values for MFMA
+v_lshlrev_b16_e32 v191, 8, v210      ; Use v210 from P conversion
+v_bitop3_b16 v191, v211, v191, s12   ; Pack bytes
+v_or_b32_sdwa v209, v191, v202       ; Create MFMA input pair
+
+; V values from Phase 1's ds_read (transposed)
+v_perm_b32 v142, v142, v142, s29     ; Transpose V
+
+; MFMA: O += P × V
+v_mfma_f32_32x32x16_fp8_fp8 v[34:49], v[144:145], v[202:203], v[34:49]
+;                                     ^^^^^^^^^ V   ^^^^^^^^^ P (FP8)
+```
+
+### Potential Optimization
+
+The FP8 P→FP8 conversion sitting between Phase 1 and Phase 2 means:
+1. **No overlap with Phase 1 memory latency** - conversion runs after ds_read completes
+2. **Not covered by scheduling hints** - outside phase markers
+3. **BF16 is better optimized** - P→BF16 in Phase 0 overlaps with MFMA latency
+
+Possible improvement: Move FP8 P conversion into Phase 0 (like BF16) to overlap with QK MFMA.
+
+### Assembly File Locations
+
+```
+aiter/jit/build/mha_fwd_fp8bf16_*/build/*v3*gfx950.s   # FP8 kernel
+aiter/jit/build/mha_fwd_bf16_*/build/*v3*gfx950.s      # BF16 kernel
+```
+
+Enable `--save-temps` in optCompilerConfig.json to generate `.s` files.

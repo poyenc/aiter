@@ -1,6 +1,6 @@
 # FP8 FMHA v3 Debug Session
 
-**Last Updated:** 2026-02-04
+**Last Updated:** 2026-02-05
 
 ---
 
@@ -15,6 +15,20 @@
 **Test Results:**
 - Minimal reproducer (q=1, k=5): Output max diff = 0.0
 - Full pytest suite: **176/176 tests pass**
+
+---
+
+## Recent Work: Assembly Analysis (2026-02-05)
+
+Analyzed FP8 vs BF16 V3 kernel assembly to understand phase structure and potential optimizations.
+
+**Key Finding:** FP8 kernel has P→FP8 conversion code located between Phase 1 and Phase 2 (outside phase markers), while BF16 has P→BF16 conversion inside Phase 0. This means:
+- FP8: P conversion runs **after** ds_read completes, no overlap with memory latency
+- BF16: P conversion overlaps with MFMA latency in Phase 0
+
+**Potential Optimization:** Move FP8 P conversion to Phase 0 (like BF16) to improve instruction overlap.
+
+See [knowledge.md](knowledge.md) for detailed assembly analysis.
 
 ---
 
