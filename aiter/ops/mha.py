@@ -59,6 +59,8 @@ def cmdGenFunc_mha_fwd(
             filter += "_fp8bf16*"
         else:
             raise NotImplementedError("Unsupported output dtype for FP8 MHA")
+    # mha_fwd doesn't support logits_soft_cap, filter to nlogits only
+    filter += "_nlogits*"
     if bias is not None:
         md_name += "_bias"
         filter += "_bias*"
