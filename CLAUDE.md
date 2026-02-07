@@ -99,6 +99,10 @@ cp $(ls ck_test/pass_1/*shader_engine_1*.att | sort | tail -1) <WORKSPACE>/backu
 - **Only record verified facts:** Do not write conclusions or hypotheses in this document until they are verified by experiments. Record experiment results and observations, not speculation.
 - **Copy exact strings when editing:** When using the Edit tool, copy the exact string from the Read output rather than reconstructing it from memory or diff output. Escaped characters (like `\"`) and whitespace must match exactly.
 - **Avoid cd to subdirectories:** Do not use `cd` to change into subdirectories in Bash commands. The working directory persists between commands, so subsequent commands will fail if they assume the initial working directory. Use absolute paths or run commands with `docker exec ... bash -c "cd /path && command"` instead.
+- **Backup before reverting:** When doing A/B assembly comparisons, **always backup source files** (e.g., `cp` to `/tmp/src_backup/` inside the container) before any `git checkout` or `git stash`. Uncommitted changes can be lost permanently.
+- **Clean builds need `rm -rf aiter/jit/build/`:** Removing only `aiter/jit/*.so` is insufficient — the `build/` directory caches `.cpp` and `.s` intermediates. Delete it too for a true clean rebuild.
+- **Git in CK submodule:** Git operations on the CK submodule only work from the **host**, not inside the Docker container (the container doesn't see `.git`). Use `git checkout HEAD -- <file>` to selectively revert files instead of `git stash` (which stashes everything).
+- **No abbreviations in code:** Never use abbreviated names for template parameters, variables, or types. Use full, descriptive names (e.g., `PipelineProblem` not `PP`, `BlockGemm` not `BG`). This applies to all code in the project, including CK submodule changes.
 
 ## JIT Compilation Mechanism
 

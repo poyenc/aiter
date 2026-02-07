@@ -1,6 +1,6 @@
 # FP8 FMHA v3 Debug Session
 
-**Last Updated:** 2026-02-06
+**Last Updated:** 2026-02-07
 
 ---
 
@@ -9,6 +9,38 @@
 **FIXED** - All FP8 FMHA v3 issues resolved.
 
 **Test Results:** Full pytest suite: **176/176 tests pass**
+
+---
+
+## Recent Work: CoreLoopScheduler Refactoring (2026-02-07)
+
+Refactored `CoreLoopScheduler` for dtype-aware instruction scheduling.
+
+### Changes
+
+1. **`arch.hpp`**: Added `TRANS = 1 << 10` to `LLVMSchedGroupMask` enum, updated `ALL`. Fixed `0x200` (DS_WRITE) → `0x400` (TRANS) bug in V3 scheduler.
+
+2. **`block_fmha_fwd_v3_pipeline.hpp`**: Replaced 150-line duplicated `CoreLoopScheduler<Problem, bool>` with:
+   - `CoreLoopSchedulingParams<Problem>` — auto-derives `kMfmaPerWarpGemm0/1` from tile/gemm config
+   - `CoreLoopSchedulerDefaultBase<Problem>` — reusable phase helpers (`schedule_gemm0_compute`, `schedule_gemm1_compute`, `schedule_load_phase`) using `LLVMSchedGroupMask` enum
+   - `CoreLoopSchedulerImpl<Problem, Q, K, V>` — dtype-specialized dispatch (bf16/fp16/fp8 specializations)
+   - `CoreLoopScheduler<Problem>` — user-facing forwarding template (simplified from 2 template params to 1)
+
+3. **Usage site**: `CoreLoopScheduler<Problem, FmhaMask::IsMasking>` → `CoreLoopScheduler<Problem>`
+
+### Key design decisions
+- WG0/WG1 phase-shift pattern factored into single `schedule()` with `effective = (WG==0) ? Phase : (Phase+3)%4`
+- Raw hex magic numbers replaced with `LLVMSchedGroupMask::MFMA` / `TRANS` / `VALU` / `SALU` enum
+- Hardcoded `8` MFMA count replaced with auto-derived `Params::kMfmaPerWarpGemm0/1`
+- bf16, fp16, and fp8 all currently share the same default base; fp8 specialization can be customized independently
+
+### Assembly verification (2026-02-07)
+**Confirmed behavior-preserving.** Compared V3 assembly (baseline: TRANS fix only, no refactoring) vs (TRANS fix + refactoring) for 6 kernel variants:
+- fp8 nmask, fp8 mask, bf16 nmask, bf16 mask, fp16 nmask, fp16 mask
+
+**Result:** All 6 variants produce **identical assembly** (only `__hip_cuid_*` compilation unit hashes differ — expected per-build randomness).
+
+**Note on TRANS mask (`0x200` → `0x400`):** The `0x400` mask is for LLVM's transcendental unit (`v_exp_f32`, `v_log_f32`, etc.), not LDS transpose reads (`ds_read_b64_tr_b8`). LDS transpose reads are DS operations.
 
 ---
 
@@ -69,6 +101,7 @@ return WarpGemmMfmaFp8Fp8F32M32N32K32SwizzleBTransposedCDistribution<>{};
 - [x] Fix distribution mismatch in v3 policy (SwizzleB variant)
 - [x] Run full pytest suite to verify fix (176/176 passed)
 - [ ] Commit fix with documentation
+- [x] Refactor CoreLoopScheduler for dtype-aware instruction scheduling (176/176 passed)
 
 ---
 

@@ -467,16 +467,20 @@ __builtin_amdgcn_sched_group_barrier(uint32_t mask, uint32_t count, uint32_t fla
 | `count` | Number of instructions of that type to schedule before proceeding |
 | `flags` | Reserved (always 0) |
 
-**Scheduler Group Masks** (from `ck/utility/blkgemmpipe_scheduler.hpp`):
+**Scheduler Group Masks** (from `include/ck_tile/core/arch/arch.hpp`):
 
 | Mask | Name | Description |
 |------|------|-------------|
 | `0x002` | VALU | Vector ALU operations |
 | `0x004` | SALU | Scalar ALU operations |
-| `0x008` | SCHED_GROUP_MFMA | Matrix FMA (MFMA) instructions |
-| `0x020` | SCHED_GROUP_VMEM | Global memory operations |
-| `0x100` | SCHED_GROUP_LDS_READ | LDS read operations |
-| `0x200` | SCHED_GROUP_LDS_WRITE / TRANS | LDS write / transpose operations |
+| `0x008` | MFMA | Matrix FMA (MFMA) instructions |
+| `0x020` | VMEM_READ | Global memory reads |
+| `0x040` | VMEM_WRITE | Global memory writes |
+| `0x100` | DS_READ | LDS read operations (including `ds_read_b64_tr_b8` transpose reads) |
+| `0x200` | DS_WRITE | LDS write operations |
+| `0x400` | TRANS | Transcendental unit (`v_exp_f32`, `v_log_f32`, `v_rcp_f32`, etc.) |
+
+**Note:** `ds_read_b64_tr_b8` (LDS transpose read) is DS_READ (`0x100`), NOT TRANS (`0x400`). TRANS is the transcendental/special-function unit.
 
 ### Two Warp Group Architecture
 
@@ -551,11 +555,10 @@ This **ping-pong pattern** ensures:
 The core compute phases (Phase 0 for WG0, Phase 1 for WG1) use this pattern:
 
 ```cpp
-// lines 56-60, 72-75, 92-96, 108-111
-static_for<0, 8, 1>{}([&](auto) {
-    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // 1 MFMA
-    __builtin_amdgcn_sched_group_barrier(0x200, 2, 0); // 2 TRANS/LDS writes
-    __builtin_amdgcn_sched_group_barrier(0x002, 2, 0); // 2 VALU
+static_for<0, kMfmaPerWarpGemm, 1>{}([&](auto) {
+    __builtin_amdgcn_sched_group_barrier(LLVMSchedGroupMask::MFMA, 1, 0);
+    __builtin_amdgcn_sched_group_barrier(LLVMSchedGroupMask::TRANS, 2, 0); // 0x400: v_exp_f32 etc.
+    __builtin_amdgcn_sched_group_barrier(LLVMSchedGroupMask::VALU, 2, 0);
 });
 ```
 
@@ -691,14 +694,17 @@ The file defines custom asm wrappers (lines 192-261) to prevent code motion:
 
 ### CoreLoopScheduler Template
 
+After refactoring (2026-02-07), the scheduler uses dtype-aware dispatch:
+
 ```cpp
-// lines 40-189
-template <typename PipelineProblem, bool kIsMasking>
-struct CoreLoopScheduler;
+template <typename PipelineProblem>
+struct CoreLoopScheduler
+    : CoreLoopSchedulerImpl<PipelineProblem, QDataType, KDataType, VDataType>
+{};
 ```
 
-Two variants exist:
-- `CoreLoopScheduler<..., true>` - With masking support (causal attention)
-- `CoreLoopScheduler<..., false>` - Without masking
+- `CoreLoopSchedulingParams<Problem>` — auto-derives MFMA counts from tile/gemm config
+- `CoreLoopSchedulerDefaultBase<Problem>` — reusable phase helpers using `LLVMSchedGroupMask` enum
+- `CoreLoopSchedulerImpl<Problem, Q, K, V>` — dtype-specialized dispatch (bf16/fp16/fp8 specializations, all currently identical)
 
-Both have identical scheduling patterns (masking is handled separately via `fmha_mask()`).
+The old `kIsMasking` template parameter was removed — masking is handled separately by `fmha_mask()`, and both mask/nomask variants have identical scheduling patterns (verified via assembly comparison).
