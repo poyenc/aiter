@@ -587,9 +587,8 @@ These serve two purposes:
 
 **Phase 0 (WarpGroup 0) - GEMM0 + Softmax:**
 ```cpp
-// lines 1057-1074
 __builtin_amdgcn_sched_barrier(0);
-s_waitcnt_lgkmcnt<0>();              // Wait for LDS operations
+s_waitcnt<waitcnt_arg::kMaxVmCnt, waitcnt_arg::kMaxExpCnt, 0>();  // Wait for LDS operations
 __builtin_amdgcn_sched_barrier(0);
 cl_calc(xdl_SP_p01_reg_idx, gemm0);  // GEMM0: Q × K^T
 fmha_alu1(xdl_SP_p23_reg_idx);       // Softmax exp + rowsum
@@ -601,18 +600,16 @@ __builtin_amdgcn_sched_barrier(0);       // Force barrier boundary
 
 **Phase 1 (WarpGroup 0) - Load K:**
 ```cpp
-// lines 1076-1083
-s_waitcnt_vmcnt<K_mem_su_ld_insts + V_mem_su_ld_insts>();  // Wait for DMA
-__builtin_amdgcn_s_barrier();                              // Workgroup sync
-cl_load(memK, K_w0_lds_wr_idx, V_w0_lds_rd_idx);           // Async K load + V LDS read
+s_waitcnt<K_mem_su_ld_insts + V_mem_su_ld_insts>();  // Wait for DMA
+__builtin_amdgcn_s_barrier();                        // Workgroup sync
+cl_load(memK, K_w0_lds_wr_idx, V_w0_lds_rd_idx);     // Async K load + V LDS read
 Scheduler::schedule(cl_p, number<1>{});
-fmha_mask(xdl_SP_p01_reg_idx);                             // Apply attention mask
+fmha_mask(xdl_SP_p01_reg_idx);                       // Apply attention mask
 ```
 
 **Phase 2 (WarpGroup 0) - GEMM1:**
 ```cpp
-// lines 1087-1098
-s_waitcnt_lgkmcnt<0>();              // Wait for LDS
+s_waitcnt<waitcnt_arg::kMaxVmCnt, waitcnt_arg::kMaxExpCnt, 0>();  // Wait for LDS
 __builtin_amdgcn_s_barrier();        // Sync
 cl_calc(xdl_SP_p23_reg_idx, gemm1);  // GEMM1: P × V
 
@@ -622,14 +619,15 @@ fmha_alu_D_upd();                    // Rescale O accumulator
 
 **Phase 3 (WarpGroup 0) - Load V:**
 ```cpp
-// lines 1100-1109
-s_waitcnt_vmcnt<K_mem_su_ld_insts + V_mem_su_ld_insts>();
+s_waitcnt<K_mem_su_ld_insts + V_mem_su_ld_insts>();
 __builtin_amdgcn_s_barrier();
 cl_load(memV, V_w0_lds_wr_idx, K_w0_lds_rd_idx);  // Async V load + K LDS read
 
 Scheduler::schedule(cl_p, number<3>{});
 kv_token_start += kN0;  // Move to next token
 ```
+
+**Note:** All `s_waitcnt` calls use CK core's architecture-aware API from `arch.hpp` (supports GFX9/GFX11/GFX12 via layout structs with `static_assert` validation). Parameter order is `<vmcnt, expcnt, lgkmcnt>`, with defaults at max (no-wait).
 
 ### Pipeline Flow Diagram
 

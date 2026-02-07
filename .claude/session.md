@@ -12,6 +12,30 @@
 
 ---
 
+## Recent Work: Replace Custom s_waitcnt with CK Core API (2026-02-07)
+
+Replaced custom `s_waitcnt` helpers in the V3 pipeline with CK core's architecture-aware `s_waitcnt` from `arch.hpp`.
+
+### Changes
+
+**File:** `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_fwd_v3_pipeline.hpp`
+
+1. **Deleted** 3 custom member functions (22 lines): `s_waitcnt<Vmcnt, Lgkmcnt, Expcnt>`, `s_waitcnt_vmcnt<Vmcnt>`, `s_waitcnt_lgkmcnt<Lgkmcnt>` — hardcoded GFX9 bit-packing with no validation.
+
+2. **Replaced 12 call sites** with CK core's `ck_tile::s_waitcnt` (from `arch.hpp`), which has `static_assert` validation and GFX9/GFX11/GFX12 support via layout structs.
+
+3. **Critical parameter order difference:** V3's custom API was `<Vmcnt, Lgkmcnt, Expcnt=7>`, CK core is `<vmcnt, expcnt, lgkmcnt>`. All translations handled correctly:
+   - `s_waitcnt_lgkmcnt<0>()` → `s_waitcnt<waitcnt_arg::kMaxVmCnt, waitcnt_arg::kMaxExpCnt, 0>()`
+   - `s_waitcnt_vmcnt<N>()` → `s_waitcnt<N>()`
+   - `s_waitcnt<V, L>()` → `s_waitcnt<V, waitcnt_arg::kMaxExpCnt, L>()`
+
+### Assembly verification (2026-02-07)
+**Confirmed behavior-preserving.** All 6 V3 kernel variants (fp8 nmask/mask, bf16 nmask/mask, fp16 nmask/mask) produce **identical assembly** (only `__hip_cuid_*` hashes differ).
+
+**Test Results:** 176/176 FP8 tests pass.
+
+---
+
 ## Recent Work: CoreLoopScheduler Refactoring (2026-02-07)
 
 Refactored `CoreLoopScheduler` for dtype-aware instruction scheduling.
@@ -102,6 +126,7 @@ return WarpGemmMfmaFp8Fp8F32M32N32K32SwizzleBTransposedCDistribution<>{};
 - [x] Run full pytest suite to verify fix (176/176 passed)
 - [ ] Commit fix with documentation
 - [x] Refactor CoreLoopScheduler for dtype-aware instruction scheduling (176/176 passed)
+- [x] Replace custom s_waitcnt with CK core API (176/176 passed, assembly identical)
 
 ---
 
