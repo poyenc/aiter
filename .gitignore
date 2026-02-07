@@ -58,7 +58,7 @@ aiter_meta
 aiter/install_mode
 
 # profiler
- .rocprofv3/
+.rocprofv3/
 ck_test/
 pass_2/
 
