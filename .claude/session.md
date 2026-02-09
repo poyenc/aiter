@@ -1,18 +1,48 @@
 # FP8 FMHA v3 Debug Session
 
-**Last Updated:** 2026-02-08
+**Last Updated:** 2026-02-09
 
 ---
 
 ## Current Status
 
-**FIXED** - All FP8 FMHA v3 issues resolved.
+**FIXED** - All FP8 FMHA v3 correctness issues resolved. Scheduling optimization in progress.
 
 **Test Results:** Full pytest suite: **176/176 tests pass**
 
+**Current assembly state (committed code):** No unnecessary instructions. Phase 2 (GEMM1) has scheduling gaps:
+- MFMAs 9-12 back-to-back (data dependency: serial max3→permlane→max→mul→fma chain)
+- 29 `v_pk_mul_f32` + 1 `v_exp_f32` trailing after last MFMA with zero interleaving
+
 ---
 
-## Recent Work: FP8 Instruction Scheduling Optimization (2026-02-09)
+## Explored and Reverted: Move exp2(sp_delta) to Phase 2 + asm volatile byte extraction (2026-02-09)
+
+### Attempt 1: Move exp2(sp_delta) from fmha_alu1 (Phase 0) to fmha_alu0 (Phase 2)
+
+Goal: Provide 32 `v_exp_f32` TRANS instructions to interleave with GEMM1 MFMAs.
+
+**Problem:** Removing exp2 from Phase 0 reduced VALU pressure. The compiler then sank the FP8 P conversion byte extraction (`packed & 0xFF`, `(packed >> 8) & 0xFF`) from Phase 0 into Phase 1 (load phase). The `v_cvt_pk_fp8_f32` was anchored by `asm volatile`, but the byte extraction was plain C++.
+
+### Attempt 2: Wrap byte extraction in asm volatile
+
+Replaced plain C++ byte extraction with `asm volatile` `v_and_b32`/`v_bfe_u32` to prevent sinking.
+
+**Problem:** The `asm volatile` forced byte values into separate VGPRs, breaking the compiler's ability to keep the packed representation. GEMM1 then needed to repack individual fp8 bytes into 32-bit registers for `v_mfma_f32_32x32x16_fp8_fp8`, generating 32 extra instructions per GEMM1 instance (16 `v_lshlrev_b16` + 16 `v_bitop3_b16`). The `bit_cast<fp8_t>(uint8_t)` is zero-cost, but the asm volatile boundary prevents the compiler from optimizing the unpack-repack round-trip.
+
+### Conclusion
+
+Both approaches reverted. The fundamental issue: any change that reduces Phase 0 instruction density risks the compiler sinking non-volatile instructions across phase boundaries. And anchoring those instructions with asm volatile breaks the compiler's register-level pack/unpack optimizations.
+
+A proper fix likely requires changing how `p.thread_buf_` stores FP8 values — keeping them packed instead of as individual bytes — to eliminate the byte extraction entirely.
+
+---
+
+## Previous Work: FP8 Instruction Scheduling Optimization (2026-02-09)
+
+---
+
+## Previous Work: FP8 Instruction Scheduling Optimization (2026-02-09)
 
 Added fp8-specific `CoreLoopSchedulerImpl` with asymmetric `sched_group_barrier` patterns for both GEMM0 and GEMM1 phases. Also added `block_gemm_mfma_count_v` variable template.
 
@@ -193,6 +223,7 @@ return WarpGemmMfmaFp8Fp8F32M32N32K32SwizzleBTransposedCDistribution<>{};
 - [x] Replace custom s_waitcnt with CK core API (176/176 passed, assembly identical)
 - [x] Fix kMfmaPerWarpGemm formula to count hardware MFMAs (176/176 passed)
 - [x] Add fp8 CoreLoopSchedulerImpl with asymmetric scheduling (176/176 passed)
+- [ ] Improve Phase 2 GEMM1 scheduling (4 back-to-back MFMAs, 29 trailing v_pk_mul_f32)
 
 ---
 

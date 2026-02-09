@@ -482,6 +482,46 @@ __builtin_amdgcn_sched_group_barrier(uint32_t mask, uint32_t count, uint32_t fla
 
 **Note:** `ds_read_b64_tr_b8` (LDS transpose read) is DS_READ (`0x100`), NOT TRANS (`0x400`). TRANS is the transcendental/special-function unit.
 
+### How `sched_group_barrier` Works (Placement Rules)
+
+**Critical:** `sched_group_barrier` directives are placed **AFTER** the code whose instructions they reorder. They operate on the scheduling region defined by the preceding `sched_barrier(0)` fence(s).
+
+**Execution model:**
+1. `sched_barrier(0)` opens a scheduling region (a fence — no instructions cross it)
+2. Instructions (MFMA, VALU, TRANS, etc.) are emitted into the region
+3. `sched_group_barrier(mask, count, 0)` directives define the desired interleaving pattern
+4. The LLVM scheduler reorders the instructions in the region to satisfy the pattern
+5. The next `sched_barrier(0)` closes the region
+
+**Example — Phase 2 code structure:**
+```cpp
+__builtin_amdgcn_sched_barrier(0);           // Open region
+// ... code with MFMAs, v_exp_f32, v_fma, v_max3 ...
+cl_calc(sp_reg_idx, gemm1);                  // Emits MFMAs + fmha_alu0
+Scheduler::schedule(cl_p, number<2>{});      // Emits sched_group_barriers AFTER the code
+__builtin_amdgcn_sched_barrier(0);           // Close region
+```
+
+The barriers at `Scheduler::schedule()` tell the scheduler: "take all the instructions above (between the fences) and reorder them so that between consecutive MFMAs there are at least N TRANS and M VALU instructions."
+
+**In assembly output**, `sched_group_barrier` comments appear after the instructions they schedule — this is correct and expected, not a bug:
+
+```asm
+; sched_barrier mask(0x00000000)              ; <-- region start
+v_mfma_f32_32x32x16_fp8_fp8 ...              ; instructions in the region
+v_exp_f32_e32 ...
+v_fma_f32 ...
+v_mfma_f32_32x32x16_fp8_fp8 ...
+v_exp_f32_e32 ...
+; sched_group_barrier mask(0x00000008) size(1) ; <-- MFMA:1 (applied to above)
+; sched_group_barrier mask(0x00000400) size(2) ; <-- TRANS:2
+; sched_group_barrier mask(0x00000002) size(4) ; <-- VALU:4
+; ...repeating pattern...
+; sched_barrier mask(0x00000000)              ; <-- region end
+```
+
+**`asm volatile` and sched_group_barrier:** Instructions inside `asm volatile` are invisible to the scheduler — they cannot be counted toward any `sched_group_barrier` quota and cannot be reordered. They stay in source-code order. Only non-`asm volatile` instructions participate in the scheduling.
+
 ### Two Warp Group Architecture
 
 The V3 pipeline divides the thread block (512 threads = 8 waves) into **two warp groups**:
@@ -540,15 +580,19 @@ This **ping-pong pattern** ensures:
 | Load | `VALU:2, SALU:4` | Light work during K/V load |
 | GEMM1 compute | `VALU:4` (if packed), `8 × (MFMA:1, VALU:4)` | 8 MFMA + VALU |
 
-**FP8 Scheduling (asymmetric):**
+**FP8 Scheduling (asymmetric, exp2 in Phase 0):**
 
 | Effective Phase | Barrier Sequence | Purpose |
 |-----------------|------------------|---------|
-| GEMM0 compute | K iter 0: `8 × (MFMA:1, TRANS:4, VALU:4)` | TRANS-heavy: softmax exp + add reduction |
+| GEMM0 compute (Phase 0) | K iter 0: `8 × (MFMA:1, TRANS:4, VALU:4)` | exp2(sp_delta) + rowsum + permlane |
 | | K iter 1: `8 × (MFMA:1, VALU:6)` | VALU-heavy: P scale + cvt_pk_fp8 + o_acc rescale |
 | Load | `VALU:2, SALU:4` | Light work during K/V load (same as default) |
-| GEMM1 compute | `VALU:4` (if packed), first half: `8 × (MFMA:1, VALU:4)` | v_perm + v_max3 + permlane chain |
+| GEMM1 compute (Phase 2) | `VALU:4` (if packed), first half: `8 × (MFMA:1, VALU:4)` | v_perm + v_max3 + permlane chain |
 | | second half: `8 × (MFMA:1, VALU:3)` | Looser constraint for data-dep limited v_fma |
+
+**Current GEMM1 scheduling gap:** MFMAs 9-12 are back-to-back due to data dependency (serial max3→permlane→max→mul→fma chain). 29 `v_pk_mul_f32` + 1 `v_exp_f32` trail after the last MFMA with zero interleaving.
+
+**Explored and reverted — moving exp2 to Phase 2:** Moving 32 `v_exp_f32` from Phase 0 to Phase 2 would provide TRANS for GEMM1 interleaving, but reducing Phase 0 instruction density caused the compiler to sink FP8 byte extraction (`packed & 0xFF`) into Phase 1. Anchoring with `asm volatile` fixed the sinking but introduced 32 extra `v_lshlrev_b16`/`v_bitop3_b16` per GEMM1 (compiler needs to repack individual fp8 bytes into 32-bit registers for MFMA). The root cause: `bit_cast<fp8_t>(uint8_t)` is zero-cost, but `asm volatile` forces bytes into separate VGPRs, preventing the compiler from keeping the packed representation.
 
 **Phase-to-effective mapping:** WG0: Phase N = effective N; WG1: Phase N = effective (N+3)%4
 
@@ -707,6 +751,14 @@ The file defines custom asm wrappers (lines 192-261) to prevent code motion:
 **Lesson:** Making instructions visible to the scheduler is not always beneficial. If the scheduler's VALU budget gets consumed by non-critical-path work (v_fma for sp_delta) at the expense of critical-path work (v_perm/v_max3 for MFMA operand preparation), overall throughput decreases.
 
 **Packed FP32 instructions and matrix core:** `v_pk_fma_f32` and `v_pk_mul_f32` execute on the **matrix core**, the same unit as `v_mfma`. They cannot run simultaneously with MFMA instructions. The compiler has a workaround that detects potential contention and selectively unpacks some packed FP32 back to scalar instructions, but it doesn't catch all cases.
+
+### Basic Block Boundaries and sched_group_barrier
+
+**`sched_group_barrier` operates within a single basic block.** A basic block is a straight-line code sequence with no branches. Conditional branches (e.g., `s_cbranch_scc1` in fmha_mask) create basic block boundaries that the scheduler cannot cross.
+
+**Impact on fmha_mask:** The per-pixel mask check in fmha_mask uses `s_cbranch_scc1`, which splits the code into separate basic blocks. Even though fmha_mask has ~96 VALU instructions (v_add, v_cmp, v_cndmask ×32), these are isolated in their own basic block and **cannot be interleaved with MFMAs** by `sched_group_barrier`.
+
+**Consequence for VALU budget:** When computing `sched_group_barrier(VALU, N)` counts for GEMM1 Phase 2, only the ~30 VALU in the same basic block as the MFMAs are available (v_perm, v_max3 chain, permlane/max/mul). Requesting more VALU than available (e.g., VALU:14 assuming fmha_mask VALU are available) creates an unsatisfiable constraint, causing the scheduler to give up and issue MFMAs back-to-back.
 
 ### Performance Optimization Rationale
 
