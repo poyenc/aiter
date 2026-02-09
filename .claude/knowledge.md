@@ -532,23 +532,25 @@ This **ping-pong pattern** ensures:
 
 ### Scheduler Patterns per Phase
 
-**WarpGroup 0 Scheduling** (lines 52-81):
+**Default Scheduling (bf16/fp16):**
 
-| Phase | Barrier Sequence | Purpose |
-|-------|------------------|---------|
-| 0 | `8 × (MFMA:1, TRANS:2, VALU:2)` | GEMM0: 8 MFMA + 16 transpose + 16 VALU |
-| 1 | `VALU:2, SALU:4` | Light work during K load |
-| 2 | `VALU:4` (if packed), `N × (MFMA:1, VALU:4)` | GEMM1: N MFMA + VALU (N=8 bf16/fp16, N=16 fp8) |
-| 3 | `VALU:2, SALU:4` | Light work during V load |
+| Effective Phase | Barrier Sequence | Purpose |
+|-----------------|------------------|---------|
+| GEMM0 compute | `8 × (MFMA:1, TRANS:2, VALU:2)` | 8 MFMA + 16 transpose + 16 VALU |
+| Load | `VALU:2, SALU:4` | Light work during K/V load |
+| GEMM1 compute | `VALU:4` (if packed), `8 × (MFMA:1, VALU:4)` | 8 MFMA + VALU |
 
-**WarpGroup 1 Scheduling** (lines 83-114):
+**FP8 Scheduling (asymmetric):**
 
-| Phase | Barrier Sequence | Purpose |
-|-------|------------------|---------|
-| 0 | `VALU:2, SALU:4` | Light work during V load |
-| 1 | `8 × (MFMA:1, TRANS:2, VALU:2)` | GEMM0: 8 MFMA + 16 transpose + 16 VALU |
-| 2 | `VALU:2, SALU:4` | Light work during K load |
-| 3 | `VALU:4` (if packed), `N × (MFMA:1, VALU:4)` | GEMM1: N MFMA + VALU (N=8 bf16/fp16, N=16 fp8) |
+| Effective Phase | Barrier Sequence | Purpose |
+|-----------------|------------------|---------|
+| GEMM0 compute | K iter 0: `8 × (MFMA:1, TRANS:4, VALU:4)` | TRANS-heavy: softmax exp + add reduction |
+| | K iter 1: `8 × (MFMA:1, VALU:6)` | VALU-heavy: P scale + cvt_pk_fp8 + o_acc rescale |
+| Load | `VALU:2, SALU:4` | Light work during K/V load (same as default) |
+| GEMM1 compute | `VALU:4` (if packed), first half: `8 × (MFMA:1, VALU:4)` | v_perm + v_max3 + permlane chain |
+| | second half: `8 × (MFMA:1, VALU:3)` | Looser constraint for data-dep limited v_fma |
+
+**Phase-to-effective mapping:** WG0: Phase N = effective N; WG1: Phase N = effective (N+3)%4
 
 ### The MFMA Pattern
 
@@ -572,31 +574,9 @@ No dtype-specific override needed — the formula derives the correct count for 
 
 ### CoreLoopScheduler Static Dispatch Pitfall
 
-`CoreLoopSchedulerDefaultBase` defines `schedule()` which calls `schedule_gemm1_compute()`. Since these are **static methods** (not virtual), `schedule()` always calls the **base class** version. If you ever need to override `schedule_gemm1_compute()` in a derived specialization, you must also override `schedule()` to call the derived version.
+`CoreLoopSchedulerDefaultBase` defines `schedule()` which calls `schedule_gemm0_compute()` and `schedule_gemm1_compute()`. Since these are **static methods** (not virtual), `schedule()` always calls the **base class** versions. To override any phase helper in a derived specialization, you must also override `schedule()` to call the derived version.
 
-**Current state:** All dtype specializations (bf16, fp16, fp8) use the empty default — no overrides are needed because the unified `kMfmaPerWarpGemm` formula correctly derives MFMA counts for all dtypes.
-
-**If overrides are needed in the future:**
-```cpp
-template <typename PipelineProblem>
-struct CoreLoopSchedulerImpl<PipelineProblem, fp8_t, fp8_t, fp8_t>
-    : CoreLoopSchedulerDefaultBase<PipelineProblem>
-{
-    using Base = CoreLoopSchedulerDefaultBase<PipelineProblem>;
-
-    CK_TILE_DEVICE static constexpr void schedule_gemm1_compute() { /* ... */ }
-
-    // Must override schedule() too — static methods have no virtual dispatch
-    template <index_t WaveGroup, index_t Phase>
-    CK_TILE_DEVICE static constexpr void schedule(number<WaveGroup>, number<Phase>)
-    {
-        constexpr index_t effective = (WaveGroup == 0) ? Phase : (Phase + 3) % 4;
-        if constexpr(effective == 0) Base::schedule_gemm0_compute();
-        else if constexpr(effective == 2) schedule_gemm1_compute();  // calls derived
-        else Base::schedule_load_phase();
-    }
-};
-```
+**Current state:** The fp8 specialization overrides `schedule_gemm0_compute()`, `schedule_gemm1_compute()`, and `schedule()` with asymmetric sched_group_barrier patterns. bf16 and fp16 use the default base.
 
 ### Phase Boundary Markers
 
@@ -732,6 +712,6 @@ struct CoreLoopScheduler
 
 - `CoreLoopSchedulingParams<Problem>` — auto-derives MFMA counts from tile/gemm config
 - `CoreLoopSchedulerDefaultBase<Problem>` — reusable phase helpers using `LLVMSchedGroupMask` enum
-- `CoreLoopSchedulerImpl<Problem, Q, K, V>` — dtype-specialized dispatch (bf16/fp16/fp8 specializations, all currently identical)
+- `CoreLoopSchedulerImpl<Problem, Q, K, V>` — dtype-specialized dispatch (fp8 has asymmetric scheduling; bf16/fp16 use default base)
 
 The old `kIsMasking` template parameter was removed — masking is handled separately by `fmha_mask()`, and both mask/nomask variants have identical scheduling patterns (verified via assembly comparison).

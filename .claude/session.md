@@ -12,6 +12,40 @@
 
 ---
 
+## Recent Work: FP8 Instruction Scheduling Optimization (2026-02-09)
+
+Added fp8-specific `CoreLoopSchedulerImpl` with asymmetric `sched_group_barrier` patterns for both GEMM0 and GEMM1 phases. Also added `block_gemm_mfma_count_v` variable template.
+
+### GEMM0 (Phase 0) — Fixed 7 back-to-back MFMAs
+
+FP8 GEMM0 has 16 MFMAs (kKIter=2) but the same TRANS work (~32 v_exp_f32) as bf16/fp16 (8 MFMAs). The uniform `MFMA:1, TRANS:2, VALU:2` pattern caused the compiler to front-load all TRANS into MFMA #1, leaving MFMAs #2-8 back-to-back.
+
+**Fix:** Two-phase pattern matching the natural K iteration boundary:
+- K iter 0 (MFMAs 1-8): `MFMA:1, TRANS:4, VALU:4` — absorbs all softmax exp + add reduction
+- K iter 1 (MFMAs 9-16): `MFMA:1, VALU:6` — absorbs P scale + cvt_pk_fp8 + o_acc rescale
+
+**Result:** Zero back-to-back MFMAs, minimum 6 VALU interleaved.
+
+### GEMM1 (Phase 2) — Reduced back-to-back MFMAs
+
+fmha_alu0's v_fma chain depends on serial max3→permlane→max→mul chain, creating data dependency gap around MFMAs 8-11.
+
+**Fix:** Asymmetric VALU constraints:
+- First half (MFMAs 1-8): `MFMA:1, VALU:4` — v_perm + v_max3 + permlane chain
+- Second half (MFMAs 9-16): `MFMA:1, VALU:3` — looser constraint for data-dep limited v_fma
+
+### Explored but reverted
+
+- `__builtin_fmaf` replacing `asm volatile fma_impl_vsv` for fp8 sp_delta — successfully interleaved v_fma with MFMAs #8-12 in Phase 2, but reverted by user
+- Unwrapping `asm volatile` from o_acc rescaling (`pk_mul_f32`) in Phase 2 — o_acc_scale data dependency (requires v_exp_f32 of row-max diff) prevents actual interleaving
+- Removing `sched_barrier(0)` between GEMM1 and `fmha_alu_D_upd()` — merged scheduling regions but o_acc_scale dependency still blocks interleaving
+
+**File:** `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_fwd_v3_pipeline.hpp`
+
+**Test Results:** 176/176 FP8 tests pass.
+
+---
+
 ## Recent Work: Fix kMfmaPerWarpGemm Formula (2026-02-09)
 
 Fixed `CoreLoopSchedulingParams` to correctly count hardware MFMAs instead of warp gemm calls.
@@ -158,6 +192,7 @@ return WarpGemmMfmaFp8Fp8F32M32N32K32SwizzleBTransposedCDistribution<>{};
 - [x] Refactor CoreLoopScheduler for dtype-aware instruction scheduling (176/176 passed)
 - [x] Replace custom s_waitcnt with CK core API (176/176 passed, assembly identical)
 - [x] Fix kMfmaPerWarpGemm formula to count hardware MFMAs (176/176 passed)
+- [x] Add fp8 CoreLoopSchedulerImpl with asymmetric scheduling (176/176 passed)
 
 ---
 
