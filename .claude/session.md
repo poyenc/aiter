@@ -10,35 +10,87 @@
 
 **Test Results:** Full pytest suite: **176/176 tests pass**
 
-**Current assembly state (committed code):** No unnecessary instructions. Phase 2 (GEMM1) has scheduling gaps:
-- MFMAs 9-12 back-to-back (data dependency: serial max3→permlane→max→mul→fma chain)
-- 29 `v_pk_mul_f32` + 1 `v_exp_f32` trailing after last MFMA with zero interleaving
+**Current assembly state (HEAD):** Phase 2 GEMM1 has 4 back-to-back MFMAs (8-11) due to data dependency chain. Full interleaving map:
+- MFMAs 1-2: 4× v_perm_b32 each (V tile operand packing)
+- MFMAs 3-6: 4× v_max3_f32 each (row max reduction)
+- MFMA 7: 6 VALU (v_mov + permlane32_swap + v_max + v_mul) — end of max chain
+- MFMAs 8-11: 4 back-to-back (v_mul only between 7-8, then 3 consecutive)
+- MFMA 12: 10× v_fma (3 before + 7 after)
+- MFMAs 13-15: 7-8× v_fma each (well interleaved)
+- MFMA 16: placed after sched_group_barrier comments
+- Trailing: v_sub + v_mul + v_exp_f32 + v_mov + 28× v_pk_mul_f32 (o_acc rescale)
 
 ---
 
-## Explored and Reverted: Move exp2(sp_delta) to Phase 2 + asm volatile byte extraction (2026-02-09)
+## Explored and Reverted: Move exp2 from fmha_alu1 to fmha_alu0 (2026-02-09)
 
-### Attempt 1: Move exp2(sp_delta) from fmha_alu1 (Phase 0) to fmha_alu0 (Phase 2)
+### Goal
+Move `exp2(sp_delta)` from `fmha_alu1` (Phase 0) to `fmha_alu0` (Phase 2) to provide 32 `v_exp_f32` TRANS instructions for GEMM1 MFMA interleaving.
 
-Goal: Provide 32 `v_exp_f32` TRANS instructions to interleave with GEMM1 MFMAs.
+### Approaches tried
 
-**Problem:** Removing exp2 from Phase 0 reduced VALU pressure. The compiler then sank the FP8 P conversion byte extraction (`packed & 0xFF`, `(packed >> 8) & 0xFF`) from Phase 0 into Phase 1 (load phase). The `v_cvt_pk_fp8_f32` was anchored by `asm volatile`, but the byte extraction was plain C++.
+**Attempt 1: Move exp2(sp_delta) only**
+Problem: Compiler sank byte extraction (`packed & 0xFF`, `>> 8`) from Phase 0 to Phase 1.
 
-### Attempt 2: Wrap byte extraction in asm volatile
+**Attempt 2: Wrap byte extraction in asm volatile**
+Problem: `asm volatile` forced bytes into separate VGPRs, breaking pack-fold optimization. 32 extra `v_lshlrev_b16` + `v_bitop3_b16` per GEMM1.
 
-Replaced plain C++ byte extraction with `asm volatile` `v_and_b32`/`v_bfe_u32` to prevent sinking.
+**Attempt 3: Packed array approach (final, correct implementation)**
+Store `cvt_pk_fp8_f32` results as packed `uint32_t` in `statically_indexed_array<std::array<uint32_t, kPPackedSize>, 2>`. Defer byte extraction to right before GEMM1 where compiler folds it with MFMA operand preparation (zero extra instructions).
 
-**Problem:** The `asm volatile` forced byte values into separate VGPRs, breaking the compiler's ability to keep the packed representation. GEMM1 then needed to repack individual fp8 bytes into 32-bit registers for `v_mfma_f32_32x32x16_fp8_fp8`, generating 32 extra instructions per GEMM1 instance (16 `v_lshlrev_b16` + 16 `v_bitop3_b16`). The `bit_cast<fp8_t>(uint8_t)` is zero-cost, but the asm volatile boundary prevents the compiler from optimizing the unpack-repack round-trip.
+### Assembly results (packed array approach)
+- Phase 2 back-to-back MFMAs reduced from 4 (MFMAs 8-11) to 1 pair (7-8)
+- MFMAs 9-15 each get 3× v_exp_f32 + 4× v_fma interleaved
+- Zero `v_lshlrev_b16`, zero `v_bitop3_b16` — clean assembly
+- 176/176 FP8 tests pass
 
-### Conclusion
+### Performance comparison (b2 n16 q16384, 5 runs each)
+- HEAD (exp2 in Phase 0): **3048 us** mean
+- exp2 moved to Phase 2: **3080 us** mean (**~1.1% regression**, consistent across runs)
 
-Both approaches reverted. The fundamental issue: any change that reduces Phase 0 instruction density risks the compiler sinking non-volatile instructions across phase boundaries. And anchoring those instructions with asm volatile breaks the compiler's register-level pack/unpack optimizations.
+### Why it regressed
+Moving exp2 to Phase 2 reduces Phase 0 VALU budget. Phase 0 needs VALU instructions to interleave with GEMM0's 16 MFMAs. With 32 fewer VALU (the v_exp_f32 TRANS), the GEMM0 interleaving quality degrades, and this outweighs the GEMM1 improvement.
 
-A proper fix likely requires changing how `p.thread_buf_` stores FP8 values — keeping them packed instead of as individual bytes — to eliminate the byte extraction entirely.
+### Lesson learned
+`bit_cast<fp8_t>(uint8_t)` is zero-cost only when the compiler can see the full pack→unpack→MFMA chain. `asm volatile` breaks this chain. The packed array approach preserves the chain by keeping values packed until consumption.
+
+### Comment added
+Documented pros/cons and potential alternatives at the `fmha_alu0` TODO site in `block_fmha_fwd_v3_pipeline.hpp`.
 
 ---
 
-## Previous Work: FP8 Instruction Scheduling Optimization (2026-02-09)
+## HEAD Phase 2 Assembly Analysis (2026-02-09)
+
+### Instruction budget for GEMM1 interleaving
+
+**fmha_alu0 instructions** (concurrent with GEMM1 on the other sp buffer):
+- 8× v_perm_b32 (V tile fp8 byte packing for MFMA operands)
+- 16× v_max3_f32 (row max reduction over 32 sp_compute elements)
+- 1× v_mov_b32 + 1× v_permlane32_swap + 2× v_max_f32 (cross-lane max)
+- 1× v_mul_f32 (compute -new_max * scale_s)
+- 32× v_fma_f32 (sp_delta = sp_compute * scale_s + (-scale_s * m), asm volatile)
+- Total: ~62 VALU
+
+**fmha_alu_D_upd instructions** (after GEMM1, o_acc rescaling):
+- 1× v_sub_f32 + 1× v_mul_f32 + 1× v_exp_f32 (o_acc_scale = exp2((m_old - m) * scale_s))
+- 1× v_mov_b32 (replicate scale for pk_mul)
+- 28× v_pk_mul_f32 (rescale 56 o_acc elements, asm volatile)
+- Total: ~32 VALU (all data-dependent on v_exp_f32 of max diff)
+
+### Current sched_group_barrier pattern (GEMM1)
+```
+First 9 barriers:  VALU:4, (MFMA:1, VALU:4) × 8   — 36 VALU requested
+Second 8 barriers: (MFMA:1, VALU:3) × 8             — 24 VALU requested
+Total requested: 60 VALU across 16 MFMAs
+```
+
+### Back-to-back MFMAs 8-11 root cause
+The v_fma chain (32 asm volatile instructions) depends on `v132 = v_mul_f32(v251, -v155)`, which depends on `v251 = v_max(cross-lane max result)`. The cross-lane max finishes during MFMA 7, so v_mul produces v132 just before MFMA 8. The first v_fma can issue during MFMA 8, but MFMA latency means its result isn't ready for the scheduler to count toward the VALU:3 quota until MFMA ~12.
+
+### Potential improvements
+1. **Break the o_acc_scale dependency**: The 28× v_pk_mul_f32 trailing block is entirely after MFMA 16 because o_acc_scale depends on v_exp_f32 of the new max. If exp2(m_old - m_new) could be computed earlier (e.g., speculative partial computation), some pk_mul could interleave with MFMAs 8-11.
+2. **Reduce VALU:4 to VALU:3 for first half**: MFMAs 1-2 have exactly 4 v_perm each, but MFMAs 3-6 have exactly 4 v_max3 each. Reducing to VALU:3 might give the scheduler more freedom at the boundary.
+3. **Use TRANS barrier for v_exp_f32**: The trailing v_exp_f32 (o_acc_scale) is a single TRANS instruction. Adding TRANS:1 somewhere might help the scheduler place it earlier if the data is ready.
 
 ---
 

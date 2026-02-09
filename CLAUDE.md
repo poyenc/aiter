@@ -103,6 +103,7 @@ cp $(ls ck_test/pass_1/*shader_engine_1*.att | sort | tail -1) <WORKSPACE>/backu
 - **Clean builds need `rm -rf aiter/jit/build/`:** Removing only `aiter/jit/*.so` is insufficient — the `build/` directory caches `.cpp` and `.s` intermediates. Delete it too for a true clean rebuild.
 - **Git in CK submodule:** Git operations on the CK submodule only work from the **host**, not inside the Docker container (the container doesn't see `.git`). Use `git checkout HEAD -- <file>` to selectively revert files instead of `git stash` (which stashes everything).
 - **No abbreviations in code:** Never use abbreviated names for template parameters, variables, or types. Use full, descriptive names (e.g., `PipelineProblem` not `PP`, `BlockGemm` not `BG`). This applies to all code in the project, including CK submodule changes.
+- **No Co-Authored-By in commits:** Do not add `Co-Authored-By` lines to commit messages.
 
 ## JIT Compilation Mechanism
 
