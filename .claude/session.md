@@ -1,6 +1,6 @@
 # FP8 FMHA v3 Debug Session
 
-**Last Updated:** 2026-02-07
+**Last Updated:** 2026-02-08
 
 ---
 
@@ -9,6 +9,36 @@
 **FIXED** - All FP8 FMHA v3 issues resolved.
 
 **Test Results:** Full pytest suite: **176/176 tests pass**
+
+---
+
+## Recent Work: Fix kMfmaPerWarpGemm Formula (2026-02-09)
+
+Fixed `CoreLoopSchedulingParams` to correctly count hardware MFMAs instead of warp gemm calls.
+
+### Bug
+`kMfmaPerWarpGemm = MIterPerWarp * NIterPerWarp * KIterPerWarp` counts **warp gemm calls**, not hardware MFMA instructions. For fp8, each warp gemm (K=32) wraps 2× `v_mfma_f32_32x32x16_fp8_fp8` (base K=16), so `kKIter=2`. The formula gave 8 instead of 16. bf16/fp16 were unaffected (kKIter=1).
+
+### Fix
+Multiply by `WarpGemm::kK / WarpGemm::WarpGemmAttribute::Impl::kK` (= kKIter) to account for internal K iterations:
+
+```cpp
+static constexpr index_t kMfmaPerWarpGemm0 =
+    QKBlockGemm::MIterPerWarp * QKBlockGemm::NIterPerWarp * QKBlockGemm::KIterPerWarp *
+    (QKBlockGemm::WarpGemm::kK / QKBlockGemm::WarpGemm::WarpGemmAttribute::Impl::kK);
+```
+
+This correctly gives 16 for fp8 (both GEMM0 and GEMM1) and is unchanged for bf16/fp16.
+
+### Assembly impact
+- **Phase 0 (QK GEMM):** MFMA barriers doubled 8→16. The extra barriers actually improved instruction interleaving — v_exp_f32 and softmax VALU instructions are now better distributed between MFMAs.
+- **Phase 2 (PV GEMM):** MFMA barriers doubled 8→16 but no instruction ordering change. The back-to-back MFMAs 8-11 persist due to data dependency (v_fma_f32 chain depends on serial v_max3→permlane→v_mul chain).
+
+No fp8-specific specialization override needed — the fix is in the generic formula.
+
+**File:** `3rdparty/composable_kernel/include/ck_tile/ops/fmha/pipeline/block_fmha_fwd_v3_pipeline.hpp`
+
+**Test Results:** 176/176 FP8 tests pass.
 
 ---
 
@@ -127,6 +157,7 @@ return WarpGemmMfmaFp8Fp8F32M32N32K32SwizzleBTransposedCDistribution<>{};
 - [ ] Commit fix with documentation
 - [x] Refactor CoreLoopScheduler for dtype-aware instruction scheduling (176/176 passed)
 - [x] Replace custom s_waitcnt with CK core API (176/176 passed, assembly identical)
+- [x] Fix kMfmaPerWarpGemm formula to count hardware MFMAs (176/176 passed)
 
 ---
 

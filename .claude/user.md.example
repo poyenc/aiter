@@ -16,6 +16,7 @@ WORKSPACE=/root/workspace/worktree/aiter-main
 
 - Preferred editor: vim
 - Commit message style: conventional commits
+- Do not add Co-Authored-By lines in commit messages
 - Test command preferences: pytest with verbose output
 
 ## Notes

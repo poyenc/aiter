@@ -538,7 +538,7 @@ This **ping-pong pattern** ensures:
 |-------|------------------|---------|
 | 0 | `8 × (MFMA:1, TRANS:2, VALU:2)` | GEMM0: 8 MFMA + 16 transpose + 16 VALU |
 | 1 | `VALU:2, SALU:4` | Light work during K load |
-| 2 | `VALU:4` (if packed), `8 × (MFMA:1, VALU:4)` | GEMM1: 8 MFMA + 32 VALU |
+| 2 | `VALU:4` (if packed), `N × (MFMA:1, VALU:4)` | GEMM1: N MFMA + VALU (N=8 bf16/fp16, N=16 fp8) |
 | 3 | `VALU:2, SALU:4` | Light work during V load |
 
 **WarpGroup 1 Scheduling** (lines 83-114):
@@ -548,26 +548,55 @@ This **ping-pong pattern** ensures:
 | 0 | `VALU:2, SALU:4` | Light work during V load |
 | 1 | `8 × (MFMA:1, TRANS:2, VALU:2)` | GEMM0: 8 MFMA + 16 transpose + 16 VALU |
 | 2 | `VALU:2, SALU:4` | Light work during K load |
-| 3 | `VALU:4` (if packed), `8 × (MFMA:1, VALU:4)` | GEMM1: 8 MFMA + 32 VALU |
+| 3 | `VALU:4` (if packed), `N × (MFMA:1, VALU:4)` | GEMM1: N MFMA + VALU (N=8 bf16/fp16, N=16 fp8) |
 
-### The 8-MFMA Pattern
+### The MFMA Pattern
 
-The core compute phases (Phase 0 for WG0, Phase 1 for WG1) use this pattern:
+The core compute phases use scheduling groups to interleave MFMA with VALU.
 
+**GEMM0 (QK matmul):** `kMfmaPerWarpGemm0` groups, each: MFMA:1, TRANS:2, VALU:2
+
+**GEMM1 (PV matmul):** `kMfmaPerWarpGemm1` groups, each: MFMA:1, VALU:4
+
+**kMfmaPerWarpGemm formula (unified for all dtypes):**
 ```cpp
-static_for<0, kMfmaPerWarpGemm, 1>{}([&](auto) {
-    __builtin_amdgcn_sched_group_barrier(LLVMSchedGroupMask::MFMA, 1, 0);
-    __builtin_amdgcn_sched_group_barrier(LLVMSchedGroupMask::TRANS, 2, 0); // 0x400: v_exp_f32 etc.
-    __builtin_amdgcn_sched_group_barrier(LLVMSchedGroupMask::VALU, 2, 0);
-});
+kMfmaPerWarpGemm = MIterPerWarp * NIterPerWarp * KIterPerWarp *
+                   (WarpGemm::kK / WarpGemm::WarpGemmAttribute::Impl::kK);
 ```
 
-This pattern issues per iteration:
-- **1 MFMA** instruction (32-cycle latency on GFX950)
-- **2 TRANS** operations (interleaved with MFMA to hide latency)
-- **2 VALU** operations (softmax/scale computations)
+The last factor (`WarpGemm::kK / Impl::kK`) is the internal K iteration count (kKIter) — the number of hardware MFMA instructions per warp gemm call:
+- **bf16/fp16:** kKIter=1 (K=16 warp gemm, K=16 base MFMA) → kMfmaPerWarpGemm = 8
+- **fp8:** kKIter=2 (K=32 warp gemm wrapping 2× K=16 `v_mfma_f32_32x32x16_fp8_fp8`) → kMfmaPerWarpGemm = 16
 
-Total per GEMM: 8 MFMA × (1 + 2 + 2) = **40 barrier groups**
+No dtype-specific override needed — the formula derives the correct count for all dtypes.
+
+### CoreLoopScheduler Static Dispatch Pitfall
+
+`CoreLoopSchedulerDefaultBase` defines `schedule()` which calls `schedule_gemm1_compute()`. Since these are **static methods** (not virtual), `schedule()` always calls the **base class** version. If you ever need to override `schedule_gemm1_compute()` in a derived specialization, you must also override `schedule()` to call the derived version.
+
+**Current state:** All dtype specializations (bf16, fp16, fp8) use the empty default — no overrides are needed because the unified `kMfmaPerWarpGemm` formula correctly derives MFMA counts for all dtypes.
+
+**If overrides are needed in the future:**
+```cpp
+template <typename PipelineProblem>
+struct CoreLoopSchedulerImpl<PipelineProblem, fp8_t, fp8_t, fp8_t>
+    : CoreLoopSchedulerDefaultBase<PipelineProblem>
+{
+    using Base = CoreLoopSchedulerDefaultBase<PipelineProblem>;
+
+    CK_TILE_DEVICE static constexpr void schedule_gemm1_compute() { /* ... */ }
+
+    // Must override schedule() too — static methods have no virtual dispatch
+    template <index_t WaveGroup, index_t Phase>
+    CK_TILE_DEVICE static constexpr void schedule(number<WaveGroup>, number<Phase>)
+    {
+        constexpr index_t effective = (WaveGroup == 0) ? Phase : (Phase + 3) % 4;
+        if constexpr(effective == 0) Base::schedule_gemm0_compute();
+        else if constexpr(effective == 2) schedule_gemm1_compute();  // calls derived
+        else Base::schedule_load_phase();
+    }
+};
+```
 
 ### Phase Boundary Markers
 
