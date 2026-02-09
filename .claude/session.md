@@ -36,7 +36,7 @@ fmha_alu0's v_fma chain depends on serial max3→permlane→max→mul chain, cre
 
 ### Explored but reverted
 
-- `__builtin_fmaf` replacing `asm volatile fma_impl_vsv` for fp8 sp_delta — successfully interleaved v_fma with MFMAs #8-12 in Phase 2, but reverted by user
+- `__builtin_fmaf` replacing `asm volatile fma_impl_vsv` for fp8 sp_delta — interleaved v_fma with MFMAs #8-12 but **profiling showed worse performance** (matrix core contention from v_pk_fma_f32 + VALU quota displacement of critical-path v_perm/v_max3)
 - Unwrapping `asm volatile` from o_acc rescaling (`pk_mul_f32`) in Phase 2 — o_acc_scale data dependency (requires v_exp_f32 of row-max diff) prevents actual interleaving
 - Removing `sched_barrier(0)` between GEMM1 and `fmha_alu_D_upd()` — merged scheduling regions but o_acc_scale dependency still blocks interleaving
 

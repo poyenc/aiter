@@ -686,6 +686,28 @@ The file defines custom asm wrappers (lines 192-261) to prevent code motion:
 | `cvt_pk_bf16_f32()` | BF16 packing |
 | `pk_mul_f32()` | Packed FP32 multiply |
 
+### asm volatile vs Instruction Scheduler
+
+**`asm volatile` is a black box to the LLVM instruction scheduler.** The scheduler cannot resolve the instruction type (VALU, MFMA, TRANS, etc.) inside an `asm volatile` block. This has two consequences:
+
+1. **`sched_group_barrier` cannot count `asm volatile` instructions.** If `sched_group_barrier(VALU, 4, 0)` requests 4 VALU instructions, any VALU wrapped in `asm volatile` is invisible — the scheduler cannot use it to satisfy the quota.
+
+2. **The scheduler cannot reorder `asm volatile` relative to other instructions.** This is the intended purpose (preventing code sinking), but it also prevents beneficial reordering like interleaving v_fma with MFMAs.
+
+**Tradeoff:** `asm volatile` is needed to anchor instructions in a specific phase (e.g., `cvt_pk_fp8_f32` in Phase 0 to prevent sinking to Phase 2). But for instructions where the compiler already has the right placement and we just want better interleaving, replacing `asm volatile` with a compiler intrinsic (e.g., `__builtin_fmaf()`) makes the instruction visible to the scheduler.
+
+**Example (tried and reverted — worse performance):** In fp8 GEMM1 (Phase 2), `fma_impl_vsv()` wraps `v_fma_f32` in `asm volatile`. Replacing with `__builtin_fmaf()` for fp8 made v_fma visible to the scheduler, which interleaved them with MFMAs #8-12. However, profiling showed **worse performance** due to:
+
+1. **Matrix core contention from `v_pk_fma_f32`**: The compiler merged some FMA pairs into packed `v_pk_fma_f32`, which execute on the matrix core (same unit as `v_mfma`). The compiler has a workaround that detects this contention and selectively unpacks some back to scalar `v_fma_f32`, but 3 out of 16 pairs remained packed — adding 3 extra matrix core instructions competing with 16 MFMAs.
+
+2. **VALU quota displacement**: `sched_group_barrier(VALU, N)` counts v_fma toward its quota, displacing critical-path VALU work (v_perm for byte packing, v_max3 for row reduction, v_permlane) to worse positions. These prepare MFMA input operands and feed the next iteration — delaying them hurts more than the v_fma interleaving helps.
+
+3. **`asm volatile` v_fma still fills gaps via source ordering**: Even though `asm volatile` is invisible to the scheduler, the hardware still executes v_fma in the gaps between MFMAs based on source code placement (after the max chain completes). The scheduling was already reasonable; making it "smarter" introduced worse tradeoffs.
+
+**Lesson:** Making instructions visible to the scheduler is not always beneficial. If the scheduler's VALU budget gets consumed by non-critical-path work (v_fma for sp_delta) at the expense of critical-path work (v_perm/v_max3 for MFMA operand preparation), overall throughput decreases.
+
+**Packed FP32 instructions and matrix core:** `v_pk_fma_f32` and `v_pk_mul_f32` execute on the **matrix core**, the same unit as `v_mfma`. They cannot run simultaneously with MFMA instructions. The compiler has a workaround that detects potential contention and selectively unpacks some packed FP32 back to scalar instructions, but it doesn't catch all cases.
+
 ### Performance Optimization Rationale
 
 1. **Hide MFMA Latency**: MFMA takes ~32 cycles; interleaving with TRANS/VALU keeps matrix cores busy
