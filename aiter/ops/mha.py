@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 from torch import Generator, Tensor
@@ -22,6 +22,7 @@ def cmdGenFunc_mha_fwd(
     v: Tensor,
     dropout_p: float,
     softmax_scale: float,
+    logits_soft_cap: float,
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
@@ -59,6 +60,12 @@ def cmdGenFunc_mha_fwd(
             filter += "_fp8bf16*"
         else:
             raise NotImplementedError("Unsupported output dtype for FP8 MHA")
+    if 0.0 < logits_soft_cap:
+        md_name += "_logits"
+        filter += "_logits*"
+    else:
+        md_name += "_nlogits"
+        filter += "_nlogits*"
     if bias is not None:
         md_name += "_bias"
         filter += "_bias*"
@@ -201,6 +208,7 @@ def mha_fwd(
     v: Tensor,
     dropout_p: float,
     softmax_scale: float,
+    logits_soft_cap: float,
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
@@ -1226,6 +1234,7 @@ def _flash_attn_forward(
     v: torch.Tensor,
     dropout_p: float,
     softmax_scale: float,
+    logits_soft_cap: float,
     causal: bool,
     window_size_left: int,
     window_size_right: int,
@@ -1268,6 +1277,7 @@ def _flash_attn_forward(
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16)
         ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
+        ret = ret and logits_soft_cap == 0.0
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -1309,6 +1319,7 @@ def _flash_attn_forward(
             v,
             dropout_p,
             softmax_scale,
+            logits_soft_cap,
             causal,
             window_size_left,
             window_size_right,
@@ -1704,6 +1715,7 @@ class FlashAttnFunc(torch.autograd.Function):
         v,
         dropout_p,
         softmax_scale,
+        logits_soft_cap,
         causal,
         window_size,
         bias,
@@ -1734,6 +1746,7 @@ class FlashAttnFunc(torch.autograd.Function):
             v,
             dropout_p,
             softmax_scale,
+            logits_soft_cap=logits_soft_cap,
             causal=causal,
             window_size_left=int(window_size[0]),
             window_size_right=int(window_size[1]),
@@ -1858,6 +1871,7 @@ def flash_attn_func(
     v,
     dropout_p=0.0,
     softmax_scale=None,
+    logits_soft_cap=0.0,
     causal=False,
     window_size=(-1, -1, 0),  # -1 means infinite context window, 0 means no sink
     bias=None,
@@ -1927,6 +1941,7 @@ def flash_attn_func(
         v,
         dropout_p,
         softmax_scale,
+        logits_soft_cap,
         causal,
         window_size,
         bias,
@@ -2996,3 +3011,105 @@ def flash_attn_varlen_fp8_pertensor_func(
     )
     out = out_padded[..., :head_size_v_og]
     return out
+
+
+@compile_ops("module_fmha_v3_fwd_ck", fc_name="fmha_v3_fwd_ck")
+def fmha_v3_fwd_ck(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    logits_soft_cap: float,
+    is_causal: bool,
+) -> List[Tensor]: ...
+
+
+@compile_ops("module_fmha_v3_varlen_fwd_ck", fc_name="fmha_v3_varlen_fwd_ck")
+def fmha_v3_varlen_fwd_ck(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    logits_soft_cap: float,
+    is_causal: bool,
+) -> List[Tensor]: ...
+
+
+def fmha_v3_fwd_ck_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float = None,
+    logits_soft_cap: float = 0.0,
+    causal: bool = False,
+):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    head_size_q_og = q.size(3)
+    head_size_v_og = v.size(3)
+    if head_size_q_og % 8 != 0:
+        q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
+        k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
+    if head_size_v_og % 8 != 0:
+        v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
+
+    out_padded = fmha_v3_fwd_ck(
+        q,
+        k,
+        v,
+        softmax_scale,
+        logits_soft_cap=logits_soft_cap,
+        is_causal=causal,
+    )[0]
+    out = out_padded[..., :head_size_v_og]
+
+    result = [out]
+
+    return result[0] if len(result) == 1 else tuple(result)
+
+
+def fmha_v3_varlen_fwd_ck_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float = None,
+    logits_soft_cap: float = 0.0,
+    causal: bool = False,
+):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    head_size_q_og = q.size(-1)
+    head_size_v_og = v.size(-1)
+    if head_size_q_og % 8 != 0:
+        q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
+        k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
+    if head_size_v_og % 8 != 0:
+        v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
+
+    out_padded = fmha_v3_varlen_fwd_ck(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        logits_soft_cap=logits_soft_cap,
+        is_causal=causal,
+    )[0]
+    out = out_padded[..., :head_size_v_og]
+
+    result = [out]
+
+    return result[0] if len(result) == 1 else tuple(result)

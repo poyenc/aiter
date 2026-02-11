@@ -869,7 +869,11 @@
         ],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
+            "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'",
+            "f'-DCK_TILE_ATTENTION_USE_SOFTSIGN_ASM={os.environ.get(\"CK_TILE_ATTENTION_USE_SOFTSIGN_ASM\", 0)}'",
+            "'-mllvm --amdgpu-disable-packed-fp32=1'",
+            "'-mllvm --greedy-reverse-local-assignment'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -895,7 +899,10 @@
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
             "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
-            "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'"
+            "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'",
+            "f'-DCK_TILE_ATTENTION_USE_SOFTSIGN_ASM={os.environ.get(\"CK_TILE_ATTENTION_USE_SOFTSIGN_ASM\", 0)}'",
+            "'-mllvm --amdgpu-disable-packed-fp32=1'",
+            "'-mllvm --greedy-reverse-local-assignment'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -1190,5 +1197,85 @@
         "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
+    },
+    "module_fmha_v3_fwd_ck": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/fmha_v3_fwd_ck_kernels.cu'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/fmha_fwd_v3.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_bf16_batch_logits_mask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_bf16_batch_logits_nmask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_bf16_batch_nlogits_mask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_bf16_batch_nlogits_nmask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_bf16_group_logits_mask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_bf16_group_logits_nmask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_bf16_group_nlogits_mask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_bf16_group_nlogits_nmask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_fp16_batch_logits_mask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_fp16_batch_logits_nmask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_fp16_batch_nlogits_mask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_fp16_batch_nlogits_nmask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_fp16_group_logits_mask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_fp16_group_logits_nmask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_fp16_group_nlogits_mask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_fp16_group_nlogits_nmask.cpp'",
+            "f'{AITER_CSRC_DIR}/pybind/fmha_v3_fwd_ck_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DNDEBUG'",
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
+            "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'",
+            "'--save-temps'",
+            "'-mllvm --amdgpu-disable-packed-fp32=1'",
+            "'-mllvm --greedy-reverse-local-assignment'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+        ],
+        "verbose": "False",
+        "hip_clang_path": "os.environ.get('CK_MHA_HIP_CLANG_PATH')",
+        "blob_gen_cmd": []
+    },
+    "module_fmha_v3_varlen_fwd_ck": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/fmha_v3_varlen_fwd_ck_kernels.cu'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/fmha_fwd_v3.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_bf16_batch_logits_mask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_bf16_batch_logits_nmask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_bf16_batch_nlogits_mask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_bf16_batch_nlogits_nmask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_bf16_group_logits_mask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_bf16_group_logits_nmask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_bf16_group_nlogits_mask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_bf16_group_nlogits_nmask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_fp16_batch_logits_mask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_fp16_batch_logits_nmask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_fp16_batch_nlogits_mask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_fp16_batch_nlogits_nmask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_fp16_group_logits_mask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_fp16_group_logits_nmask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_fp16_group_nlogits_mask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_fp16_group_nlogits_nmask.cpp'",
+            "f'{AITER_CSRC_DIR}/pybind/fmha_v3_varlen_fwd_ck_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DNDEBUG'",
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
+            "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'",
+            "'--save-temps'",
+            "'-mllvm --amdgpu-disable-packed-fp32=1'",
+            "'-mllvm --greedy-reverse-local-assignment'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+        ],
+        "verbose": "False",
+        "hip_clang_path": "os.environ.get('CK_MHA_HIP_CLANG_PATH')",
+        "blob_gen_cmd": []
     }
 }

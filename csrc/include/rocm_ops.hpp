@@ -871,6 +871,7 @@ namespace py = pybind11;
           py::arg("v"),                            \
           py::arg("dropout_p"),                    \
           py::arg("softmax_scale"),                \
+          py::arg("logits_soft_cap"),              \
           py::arg("is_causal"),                    \
           py::arg("window_size_left"),             \
           py::arg("window_size_right"),            \
@@ -1811,3 +1812,27 @@ namespace py = pybind11;
           py::arg("input"),                  \
           py::arg("weight"),                 \
           py::arg("epsilon"));
+
+#define MHA_V3_FWD_CK_PYBIND                  \
+    m.def("fmha_v3_fwd_ck",                   \
+          &aiter::torch_itfs::fmha_v3_fwd_ck, \
+          py::arg("q"),                       \
+          py::arg("k"),                       \
+          py::arg("v"),                       \
+          py::arg("softmax_scale"),           \
+          py::arg("logits_soft_cap"),         \
+          py::arg("is_causal"));
+
+#define MHA_V3_VARLEN_FWD_CK_PYBIND                  \
+    m.def("fmha_v3_varlen_fwd_ck",                   \
+          &aiter::torch_itfs::fmha_v3_varlen_fwd_ck, \
+          py::arg("q"),                              \
+          py::arg("k"),                              \
+          py::arg("v"),                              \
+          py::arg("cu_seqlens_q"),                   \
+          py::arg("cu_seqlens_k"),                   \
+          py::arg("max_seqlen_q"),                   \
+          py::arg("max_seqlen_k"),                   \
+          py::arg("softmax_scale"),                  \
+          py::arg("logits_soft_cap"),                \
+          py::arg("is_causal"));

@@ -10,6 +10,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor& q,       // [b, sq, hq, d]
                                 const at::Tensor& v, // [b, sk, hk, d]
                                 float p_dropout,
                                 float softmax_scale,
+                                float logits_soft_cap,
                                 bool is_causal,
                                 int window_size_left,
                                 int window_size_right,
