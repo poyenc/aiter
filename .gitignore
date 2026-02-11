@@ -63,4 +63,4 @@ ck_test/
 pass_2/
 
 # AI agent config (keep .claude/*.md for documentation)
-.claude/*
+.claude
