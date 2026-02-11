@@ -64,7 +64,3 @@ pass_2/
 
 # AI agent config (keep .claude/*.md for documentation)
 .claude/*
-!.claude/user.md.example
-!.claude/issues.md
-!.claude/session.md
-!.claude/knowledge.md
