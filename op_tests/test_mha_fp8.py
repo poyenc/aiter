@@ -1,16 +1,269 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import math
 import torch
 import aiter
 from aiter import dtypes
-from aiter.test_common import run_perftest
+from aiter.test_common import run_perftest, perftest
 from aiter import per_tensor_quant
+from einops import repeat
 import pytest
 import pandas as pd
 import argparse
 
 benchmark = {}
+
+
+def attention_fp8_ref_online(
+    q_fp8,
+    k_fp8,
+    v_fp8,
+    q_descale: float,
+    k_descale: float,
+    v_descale: float,
+    causal=False,
+    window_size=(-1, -1),
+    kv_tile_size=128,
+):
+    """
+    Reference implementation simulating online softmax with KV tiling.
+
+    This matches the kernel's tile-by-tile computation for debugging.
+    KV tile size = 64 (kN0 in the v3 pipeline).
+    """
+    if causal:
+        window_size = (window_size[0], 0)
+
+    batch_size, seqlen_q, nheads, d = q_fp8.shape
+    seqlen_k = k_fp8.shape[1]
+    d_v = v_fp8.shape[-1]
+
+    # FP8 E4M3 max value
+    fp8_max = torch.finfo(dtypes.fp8).max  # 448.0
+
+    # log2(e) for FAST_EXP2 path
+    log2e = math.log2(math.e)
+
+    # Dequantize fp8 inputs to fp32
+    q = q_fp8.float()
+    k = k_fp8.float()
+    v = v_fp8.float()
+
+    # Handle GQA
+    k = repeat(k, "b s h d -> b s (h g) d", g=nheads // k_fp8.shape[2])
+    v = repeat(v, "b s h d -> b s (h g) d", g=nheads // v_fp8.shape[2])
+
+    # scale_s = (1/sqrt(d)) * log2(e) * q_descale * k_descale
+    scale_s = (1.0 / math.sqrt(d)) * log2e * q_descale * k_descale
+    scale_p = fp8_max
+
+    # Initialize online softmax state
+    # m: row max (for numerical stability), shape [batch, nheads, seqlen_q]
+    # l: row sum of exp, shape [batch, nheads, seqlen_q]
+    # o_acc: output accumulator, shape [batch, seqlen_q, nheads, d_v]
+    m = torch.full((batch_size, nheads, seqlen_q), float("-inf"), device=q_fp8.device, dtype=torch.float32)
+    l = torch.zeros((batch_size, nheads, seqlen_q), device=q_fp8.device, dtype=torch.float32)
+    o_acc = torch.zeros((batch_size, seqlen_q, nheads, d_v), device=q_fp8.device, dtype=torch.float32)
+
+    num_kv_tiles = (seqlen_k + kv_tile_size - 1) // kv_tile_size
+
+    for tile_idx in range(num_kv_tiles):
+        kv_start = tile_idx * kv_tile_size
+        kv_end = min(kv_start + kv_tile_size, seqlen_k)
+
+        # Get K, V tiles: [batch, tile_len, nheads, d]
+        k_tile = k[:, kv_start:kv_end, :, :]
+        v_tile = v[:, kv_start:kv_end, :, :]
+
+        # Step 1: Compute S = Q @ K_tile^T for this tile
+        # scores: [batch, nheads, seqlen_q, tile_len]
+        scores = torch.einsum("bthd,bshd->bhts", q, k_tile)
+
+        # Apply causal mask for this tile
+        if window_size[0] >= 0 or window_size[1] >= 0:
+            row_idx = torch.arange(seqlen_q, device=q_fp8.device, dtype=torch.long).view(-1, 1)
+            col_idx = torch.arange(kv_start, kv_end, device=q_fp8.device, dtype=torch.long)
+            if window_size[0] < 0:
+                # Causal only
+                mask = col_idx > row_idx + seqlen_k - seqlen_q + window_size[1]
+            else:
+                mask = torch.logical_or(
+                    col_idx > row_idx + seqlen_k - seqlen_q + window_size[1],
+                    col_idx < row_idx + seqlen_k - seqlen_q - window_size[0],
+                )
+            scores.masked_fill_(mask, float("-inf"))
+
+        # Step 2: Online softmax update
+        # Compute local row max for this tile
+        m_tile = scores.max(dim=-1).values  # [batch, nheads, seqlen_q]
+
+        # Handle fully masked rows
+        m_tile = torch.where(torch.isinf(m_tile), torch.full_like(m_tile, float("-inf")), m_tile)
+
+        # New global max
+        m_new = torch.maximum(m, m_tile)
+        # Handle case where both are -inf
+        m_new = torch.where(torch.isinf(m_new), torch.zeros_like(m_new), m_new)
+
+        # Rescaling factors
+        # alpha = exp2(scale_s * (m_old - m_new)) - rescale old accumulator
+        # For rows where m was -inf, alpha should be 0
+        alpha = torch.exp2(scale_s * (m - m_new))
+        alpha = torch.where(torch.isinf(m), torch.zeros_like(alpha), alpha)
+
+        # Compute P = exp2(scale_s * (scores - m_new))
+        p_compute = torch.exp2(scale_s * (scores - m_new.unsqueeze(-1)))
+
+        # Step 3: Rescale o_acc by alpha
+        # o_acc shape: [batch, seqlen_q, nheads, d_v]
+        # alpha shape: [batch, nheads, seqlen_q] -> [batch, seqlen_q, nheads, 1]
+        alpha_for_o = alpha.permute(0, 2, 1).unsqueeze(-1)
+        o_acc = o_acc * alpha_for_o
+
+        # Step 4: Rescale l by alpha and add new sum
+        l = l * alpha + p_compute.sum(dim=-1)
+
+        # Step 5: Quantize P to fp8 and accumulate PV
+        p_fp8 = (p_compute * scale_p).to(dtypes.fp8)
+        p_dequant = p_fp8.float()
+
+        # PV GEMM: [batch, nheads, seqlen_q, tile_len] @ [batch, tile_len, nheads, d_v]
+        # -> [batch, seqlen_q, nheads, d_v]
+        o_tile = torch.einsum("bhts,bshd->bthd", p_dequant, v_tile)
+        o_acc = o_acc + o_tile
+
+        # Update m
+        m = m_new
+
+    # Final normalization: O = o_acc / l
+    l_for_div = l.permute(0, 2, 1).unsqueeze(-1).clamp(min=1e-9)
+    output = o_acc / l_for_div
+
+    # Apply output scale
+    scale_o = v_descale / scale_p
+    output = (output * scale_o).to(torch.bfloat16)
+
+    return output
+
+
+def attention_fp8_ref(
+    q_fp8,
+    k_fp8,
+    v_fp8,
+    q_descale: float,
+    k_descale: float,
+    v_descale: float,
+    causal=False,
+    window_size=(-1, -1),
+):
+    """
+    Reference implementation for FP8 FMHA kernel computation.
+
+    Simulates the FP8 flash attention kernel computation flow with FAST_EXP2 path:
+    1. QK^T GEMM: fp8 x fp8 -> fp32 (no scaling yet)
+    2. Online softmax using exp2: scale_s includes log2(e) factor
+       - scale_s = (1/sqrt(d)) * log2(e) * q_descale * k_descale
+       - p = exp2(scale_s * (scores - row_max))
+    3. P quantization: P_fp8 = (P_fp32 * scale_p).to(fp8), where scale_p = fp8_max
+    4. PV GEMM: fp8 x fp8 -> fp32
+    5. Output conversion: O_bf16 = (O_fp32 * scale_o).to(bf16), where scale_o = v_descale / scale_p
+
+    Arguments:
+        q_fp8: (batch_size, seqlen_q, nheads, head_dim) - fp8 quantized query
+        k_fp8: (batch_size, seqlen_k, nheads_k, head_dim) - fp8 quantized key
+        v_fp8: (batch_size, seqlen_k, nheads_k, head_dim_v) - fp8 quantized value
+        q_descale: scale factor for dequantizing q
+        k_descale: scale factor for dequantizing k
+        v_descale: scale factor for dequantizing v
+        causal: whether to apply causal masking
+        window_size: (int, int), left and right window size, -1 means infinite
+
+    Returns:
+        output: (batch_size, seqlen_q, nheads, head_dim_v) - bf16
+    """
+    if causal:
+        window_size = (window_size[0], 0)
+
+    seqlen_q, seqlen_k = q_fp8.shape[1], k_fp8.shape[1]
+    d = q_fp8.shape[-1]
+
+    # FP8 E4M3 max value
+    fp8_max = torch.finfo(dtypes.fp8).max  # 448.0
+
+    # log2(e) for FAST_EXP2 path
+    log2e = math.log2(math.e)  # 1.4426950408889634
+
+    # Dequantize fp8 inputs to fp32 for GEMM simulation
+    q = q_fp8.float()
+    k = k_fp8.float()
+    v = v_fp8.float()
+
+    # Handle GQA (grouped query attention)
+    k = repeat(k, "b s h d -> b s (h g) d", g=q_fp8.shape[2] // k_fp8.shape[2])
+    v = repeat(v, "b s h d -> b s (h g) d", g=q_fp8.shape[2] // v_fp8.shape[2])
+
+    # Step 1: QK^T GEMM (fp8 x fp8 -> fp32)
+    # In FAST_EXP2 path, scores are NOT scaled here
+    scores = torch.einsum("bthd,bshd->bhts", q, k)
+
+    # Apply causal/local mask (aligned with attention_ref implementation)
+    if window_size[0] >= 0 or window_size[1] >= 0:
+        row_idx = torch.arange(seqlen_q, device=q_fp8.device, dtype=torch.long).view(
+            -1, 1
+        )
+        col_idx = torch.arange(seqlen_k, device=q_fp8.device, dtype=torch.long)
+        if window_size[0] < 0:
+            # Causal only (no left window limit)
+            mask = col_idx > row_idx + seqlen_k - seqlen_q + window_size[1]
+        else:
+            # Sliding window attention
+            mask = torch.logical_or(
+                col_idx > row_idx + seqlen_k - seqlen_q + window_size[1],
+                col_idx < row_idx + seqlen_k - seqlen_q - window_size[0],
+            )
+        scores.masked_fill_(mask, float("-inf"))
+
+    # Step 2: Softmax using exp2 (FAST_EXP2 path) - online softmax style
+    # scale_s = (1/sqrt(d)) * log2(e) * q_descale * k_descale
+    scale_s = (1.0 / math.sqrt(d)) * log2e * q_descale * k_descale
+
+    # Compute row max for numerical stability
+    row_max = scores.max(dim=-1, keepdim=True).values
+    # Handle fully masked rows (all -inf) to avoid NaN from -inf - (-inf)
+    row_max = torch.where(torch.isinf(row_max), torch.zeros_like(row_max), row_max)
+
+    # IMPORTANT: This is UNNORMALIZED - kernel does NOT divide by sum before quantization
+    p_compute = torch.exp2(scale_s * (scores - row_max))
+
+    # Step 3: P quantization (fp32 -> fp8)
+    # Kernel quantizes UNNORMALIZED p_compute: P_fp8 = (p_compute * scale_p).to(fp8)
+    scale_p = fp8_max
+    p_fp8 = (p_compute * scale_p).to(dtypes.fp8)
+
+    # Step 4: PV GEMM (fp8 x fp8 -> fp32)
+    # Dequantize p_fp8 back to float for computation
+    p_dequant = p_fp8.float()
+    output = torch.einsum("bhts,bshd->bthd", p_dequant, v)
+
+    # Step 5: Output normalization and scaling
+    # In kernel: o_acc *= 1/l (where l is sum of unnormalized p)
+    # Then: o_acc *= scale_o where scale_o = v_descale / scale_p
+    p_sum = p_compute.sum(dim=-1, keepdim=True)  # Sum of unnormalized p
+    # p_sum shape is [b, h, t, 1], but output shape is [b, t, h, d]
+    # Need to permute p_sum to match: [b, h, t, 1] -> [b, t, h, 1]
+    p_sum_for_div = p_sum.permute(0, 2, 1, 3)
+    output = output / p_sum_for_div.clamp(min=1e-9)
+
+    scale_o = v_descale / scale_p
+    output = (output * scale_o).to(torch.bfloat16)
+
+    return output
+
+
+@perftest()
+def profile_func(target_func, *args, **kwargs):
+    return target_func(*args, **kwargs)
 
 
 def run_ck(
@@ -22,8 +275,15 @@ def run_ck(
     q_descale=None,
     k_descale=None,
     v_descale=None,
+    profile=False,
 ):
     if q.dtype == dtypes.fp8 and k.dtype == dtypes.fp8 and v.dtype == dtypes.fp8:
+        if profile:
+            return profile_func(
+                aiter.flash_attn_fp8_pertensor_func,
+                q, k, v, q_descale, k_descale, v_descale,
+                causal=causal, window_size=window_size,
+            )
         return run_perftest(
             aiter.flash_attn_fp8_pertensor_func,
             q,
@@ -34,8 +294,17 @@ def run_ck(
             v_descale,
             causal=causal,
             window_size=window_size,
+            num_iters=2,
+            num_warmup=0,
         )
     else:
+        if profile:
+            return profile_func(
+                aiter.flash_attn_func,
+                q, k, v, dropout_p=0.0, causal=causal, window_size=window_size,
+                bias=None, alibi_slopes=None, deterministic=True,
+                return_lse=False, return_attn_probs=False,
+            )
         return run_perftest(
             aiter.flash_attn_func,
             q,
@@ -49,6 +318,8 @@ def run_ck(
             deterministic=True,
             return_lse=False,
             return_attn_probs=False,
+            num_iters=2,
+            num_warmup=0,
         )
 
 
@@ -80,15 +351,9 @@ def run_ck(
     ],
 )
 def test_flash_attn_output(
-    batch_size,
-    nheads,
-    nheads_k,
-    seqlen_q,
-    seqlen_k,
-    d,
-    d_v,
-    causal,
-    local,
+    batch_size, nheads, nheads_k, seqlen_q, seqlen_k, d, d_v, causal, local,
+    kv_tile_size=128,
+    profile=False,
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
@@ -127,12 +392,20 @@ def test_flash_attn_output(
         q_descale,
         k_descale,
         v_descale,
+        profile=profile,
     )
-    out_ref, us_fwd = run_ck(q, k, v, causal, window_size)
+
+    out_ref = attention_fp8_ref_online(
+        q_quant, k_quant, v_quant,
+        q_descale.item(), k_descale.item(), v_descale.item(),
+        causal=causal,
+        window_size=window_size,
+        kv_tile_size=kv_tile_size,
+    )
 
     max_diff = (out - out_ref).abs().max().item()
     print(f"Output max diff: {max_diff}")
-    assert max_diff < 0.055
+    assert max_diff < 0.02
 
     fwd_flop = (
         batch_size
@@ -140,15 +413,7 @@ def test_flash_attn_output(
         * (seqlen_q * seqlen_k * d * 2 + seqlen_q * seqlen_k * d_v * 2)
     )
 
-    dtype_bytes = torch.finfo(dtype).bits // 8
     quant_dtype_bytes = torch.finfo(quant_dtype).bits // 8
-
-    fwd_num_bytes = (
-        batch_size
-        * nheads
-        * dtype_bytes
-        * (seqlen_q * d + seqlen_k * d + seqlen_k * d_v + seqlen_q * d_v)
-    )
     quant_fwd_num_bytes = (
         batch_size
         * nheads
@@ -159,9 +424,6 @@ def test_flash_attn_output(
     benchmark["quant_fwd_us"] = us_quant_fwd
     benchmark["quant_fwd_tflops"] = (fwd_flop) / 1.0e6 / us_quant_fwd
     benchmark["quant_fwd_gb_per_sec"] = (quant_fwd_num_bytes) / 1.0e3 / us_quant_fwd
-    benchmark["fwd_us"] = us_fwd
-    benchmark["fwd_tflops"] = (fwd_flop) / 1.0e6 / us_fwd
-    benchmark["fwd_gb_per_sec"] = (fwd_num_bytes) / 1.0e3 / us_fwd
 
 
 parser = argparse.ArgumentParser(
@@ -238,6 +500,13 @@ parser.add_argument(
     help="""Local attention. Default is False.
     -l or --local    # enable local attention""",
 )
+parser.add_argument(
+    "-p",
+    "--profile",
+    action="store_true",
+    help="""Profile mode: run kernel without warmup for profiling.
+    -p or --profile    # enable profile mode""",
+)
 
 if __name__ == "__main__":
     args = parser.parse_args()
@@ -246,7 +515,6 @@ if __name__ == "__main__":
     seqlen_k = args.seqlen_k if args.seqlen_k > 0 else args.seqlen_q
     d_v = args.d_v if args.d_v > 0 else args.d_qk
 
-    collected = []
     test_flash_attn_output(
         args.batch_size,
         args.nheads,
@@ -257,8 +525,8 @@ if __name__ == "__main__":
         d_v,
         args.causal,
         args.local,
+        profile=args.profile,
     )
-    collected.append(benchmark)
 
-    df = pd.DataFrame(collected)
+    df = pd.DataFrame([benchmark])
     aiter.logger.info(f"mha summary:\n{df}")

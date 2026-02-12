@@ -2938,6 +2938,7 @@ def flash_attn_fp8_pertensor_func(
         v,
         0.0,
         softmax_scale,
+        0.0,
         causal=causal,
         window_size_left=int(window_size[0]),
         window_size_right=int(window_size[1]),
