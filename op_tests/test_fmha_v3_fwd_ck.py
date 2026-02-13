@@ -99,8 +99,6 @@ def test_fmha_v3_fwd_ck(
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
 
-    if causal and seqlen_k < seqlen_q:
-        pytest.skip("Causal attention not supported for seqlen_k < seqlen_q")
 
     def print_tensor(tensor, tensor_name):
         tensor_list = tensor.tolist()
@@ -241,8 +239,6 @@ def test_fmha_v3_varlen_fwd_ck(
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
 
-    if causal and seqlen_k < seqlen_q:
-        pytest.skip("Causal attention not supported for seqlen_k < seqlen_q")
 
     def print_tensor(tensor, tensor_name):
         tensor_list = tensor.tolist()
