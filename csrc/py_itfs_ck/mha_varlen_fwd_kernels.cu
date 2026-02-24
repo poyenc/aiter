@@ -569,6 +569,10 @@ mha_varlen_fwd(
         auto stream = at::hip::getCurrentHIPStream();
         ck_tile::stream_config stream_config{stream};
 
+        const char* log_level_str = std::getenv("CK_LOG_LEVEL");
+        int log_level = log_level_str ? std::atoi(log_level_str) : 0;
+        stream_config.log_level_ = log_level;
+
         if (paged_KV)
         {
             int num_splits = 0;

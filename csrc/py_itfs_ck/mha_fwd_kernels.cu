@@ -342,6 +342,10 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         auto stream = at::hip::getCurrentHIPStream();
         ck_tile::stream_config stream_config{stream};
 
+        const char* log_level_str = std::getenv("CK_LOG_LEVEL");
+        int log_level = log_level_str ? std::atoi(log_level_str) : 0;
+        stream_config.log_level_ = log_level;
+
         auto args =
             get_ck_fmha_fwd_args(
                 has_lse,
