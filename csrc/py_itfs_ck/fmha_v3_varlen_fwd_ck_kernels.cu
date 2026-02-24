@@ -136,6 +136,11 @@ std::vector<at::Tensor> fmha_v3_varlen_fwd_ck(const at::Tensor& q,            //
 
     auto stream = at::cuda::getCurrentHIPStream().stream();
     ck_tile::stream_config stream_config{stream};
+    // Enable kernel name logging via CK_LOG_LEVEL environment variable
+    const char* ck_log_env = std::getenv("CK_LOG_LEVEL");
+    if (ck_log_env != nullptr) {
+        stream_config.log_level_ = std::atoi(ck_log_env);
+    }
 
     fmha_fwd_v3(traits, args, stream_config);
 

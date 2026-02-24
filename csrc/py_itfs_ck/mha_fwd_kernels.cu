@@ -353,6 +353,11 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
         auto stream = at::hip::getCurrentHIPStream();
         ck_tile::stream_config stream_config{stream};
+        // Enable kernel name logging via CK_LOG_LEVEL environment variable
+        const char* ck_log_env = std::getenv("CK_LOG_LEVEL");
+        if (ck_log_env != nullptr) {
+            stream_config.log_level_ = std::atoi(ck_log_env);
+        }
 
         auto args =
             get_ck_fmha_fwd_args(
