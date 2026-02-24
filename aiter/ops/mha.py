@@ -2996,3 +2996,90 @@ def flash_attn_varlen_fp8_pertensor_func(
     )
     out = out_padded[..., :head_size_v_og]
     return out
+
+
+def fmha_v3_fwd_ck_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float = None,
+    logits_soft_cap: float = 0.0,
+    causal: bool = False,
+):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    head_size_q_og = q.size(3)
+    head_size_v_og = v.size(3)
+    if head_size_q_og % 8 != 0:
+        q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
+        k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
+    if head_size_v_og % 8 != 0:
+        v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
+
+    out_padded, _, _, _ = _flash_attn_forward(
+        q,
+        k,
+        v,
+        0.0,
+        softmax_scale,
+        logits_soft_cap,
+        causal=causal,
+        window_size_left=-1,
+        window_size_right=-1,
+        sink_size=0,
+        bias=None,
+        alibi_slopes=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        return_lse=False,
+        return_softmax=False,
+    )
+    out = out_padded[..., :head_size_v_og]
+    return out
+
+
+def fmha_v3_varlen_fwd_ck_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float = None,
+    logits_soft_cap: float = 0.0,
+    causal: bool = False,
+):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    head_size_q_og = q.size(-1)
+    head_size_v_og = v.size(-1)
+    if head_size_q_og % 8 != 0:
+        q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
+        k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
+    if head_size_v_og % 8 != 0:
+        v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
+
+    out_padded, _, _, _ = _flash_attn_varlen_forward(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        None,
+        None,
+        max_seqlen_q,
+        max_seqlen_k,
+        0,
+        0.0,
+        softmax_scale,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        return_lse=False,
+        return_softmax=False,
+    )
+    out = out_padded[..., :head_size_v_og]
+    return out
