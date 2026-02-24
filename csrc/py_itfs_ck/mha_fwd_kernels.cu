@@ -34,6 +34,7 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                                    at::Tensor softmax_lse,
                                    at::Tensor dropout_randval,
                                    float softmax_scale,
+                                   float logits_soft_cap,
                                    float p_dropout,
                                    std::pair<uint64_t*, uint64_t*> drop_seed_offset,
                                    const std::optional<at::Tensor> &cu_seqlens_q_,
@@ -136,7 +137,7 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                         h,             // nhead_q
                         h_k,           // nhead_k
                         softmax_scale, // scale_s
-                        0.0,           // logits_soft_cap
+                        logits_soft_cap, // logits_soft_cap
                         stride_q,
                         stride_k,
                         stride_v,
@@ -173,6 +174,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         const at::Tensor &v, // [b, sk, hk, d_v]
         float p_dropout,
         float softmax_scale,
+        float logits_soft_cap,
         bool is_causal,
         int window_size_left,
         int window_size_right,
@@ -370,6 +372,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
                 softmax_lse,
                 p,
                 softmax_scale,
+                logits_soft_cap,
                 p_dropout,
                 drop_seed_offset,
                 cu_seqlens_q_,

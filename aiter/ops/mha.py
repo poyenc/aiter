@@ -22,6 +22,7 @@ def cmdGenFunc_mha_fwd(
     v: Tensor,
     dropout_p: float,
     softmax_scale: float,
+    logits_soft_cap: float,
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
@@ -59,8 +60,12 @@ def cmdGenFunc_mha_fwd(
             filter += "_fp8bf16*"
         else:
             raise NotImplementedError("Unsupported output dtype for FP8 MHA")
-    # mha_fwd doesn't support logits_soft_cap, filter to nlogits only
-    filter += "_nlogits*"
+    if 0.0 < logits_soft_cap:
+        md_name += "_logits"
+        filter += "_logits*"
+    else:
+        md_name += "_nlogits"
+        filter += "_nlogits*"
     if bias is not None:
         md_name += "_bias"
         filter += "_bias*"
@@ -169,6 +174,7 @@ def gen_mha_fwd_fake_tensors(
     v: torch.Tensor,
     dropout_p: float,
     softmax_scale: float,
+    logits_soft_cap: float,
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
@@ -203,6 +209,7 @@ def mha_fwd(
     v: Tensor,
     dropout_p: float,
     softmax_scale: float,
+    logits_soft_cap: float,
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
@@ -1220,6 +1227,7 @@ def _flash_attn_forward(
     v: torch.Tensor,
     dropout_p: float,
     softmax_scale: float,
+    logits_soft_cap: float,
     causal: bool,
     window_size_left: int,
     window_size_right: int,
@@ -1256,6 +1264,7 @@ def _flash_attn_forward(
         ret = alibi_slopes is None
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
+        ret = ret and (logits_soft_cap == 0.0)
         ret = ret and (hdim_v == 128)
         ret = ret and (hdim_q == 128 or hdim_q == 192)
         ret = ret and (nhead_q % nhead_k == 0)
@@ -1303,6 +1312,7 @@ def _flash_attn_forward(
             v,
             dropout_p,
             softmax_scale,
+            logits_soft_cap,
             causal,
             window_size_left,
             window_size_right,
@@ -1698,6 +1708,7 @@ class FlashAttnFunc(torch.autograd.Function):
         v,
         dropout_p,
         softmax_scale,
+        logits_soft_cap,
         causal,
         window_size,
         bias,
@@ -1728,6 +1739,7 @@ class FlashAttnFunc(torch.autograd.Function):
             v,
             dropout_p,
             softmax_scale,
+            logits_soft_cap,
             causal=causal,
             window_size_left=int(window_size[0]),
             window_size_right=int(window_size[1]),
@@ -1811,25 +1823,28 @@ class FlashAttnFunc(torch.autograd.Function):
         #  3 v
         #  4 dropout_p
         #  5 softmax_scale
-        #  6 causal
-        #  7 window_size (tuple - no grad)
-        #  8 bias
-        #  9 alibi_slopes
-        # 10 deterministic
-        # 11 return_lse
-        # 12 return_softmax
-        # 13 is_grad_enabled
-        # 14 is_v3_atomic_fp32
-        # 15 how_v3_bf16_cvt
-        # 16 cu_seqlens_q
-        # 17 cu_seqlens_kv
-        # Need to return exactly 17 gradient entries.
+        #  6 logits_soft_cap
+        #  7 causal
+        #  8 window_size (tuple - no grad)
+        #  9 bias
+        # 10 alibi_slopes
+        # 11 deterministic
+        # 12 return_lse
+        # 13 return_softmax
+        # 14 is_grad_enabled
+        # 15 is_v3_atomic_fp32
+        # 16 how_v3_bf16_cvt
+        # 17 cu_seqlens_q
+        # 18 cu_seqlens_kv
+        # 19 sink_ptr
+        # Need to return exactly 19 gradient entries.
         return (
             dq,  # q
             dk,  # k
             dv,  # v
             None,  # dropout_p
             None,  # softmax_scale
+            None,  # logits_soft_cap
             None,  # causal
             None,  # window_size
             dbias,  # bias
@@ -1852,6 +1867,7 @@ def flash_attn_func(
     v,
     dropout_p=0.0,
     softmax_scale=None,
+    logits_soft_cap=0.0,
     causal=False,
     window_size=(-1, -1, 0),  # -1 means infinite context window, 0 means no sink
     bias=None,
@@ -1921,6 +1937,7 @@ def flash_attn_func(
         v,
         dropout_p,
         softmax_scale,
+        logits_soft_cap,
         causal,
         window_size,
         bias,
@@ -2905,6 +2922,7 @@ def flash_attn_fp8_pertensor_func(
         v,
         0.0,
         softmax_scale,
+        0.0,
         causal=causal,
         window_size_left=int(window_size[0]),
         window_size_right=int(window_size[1]),
