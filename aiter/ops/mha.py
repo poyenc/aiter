@@ -351,12 +351,12 @@ def cmdGenFunc_mha_varlen_fwd(
         filter_fwd_splitkv2 = "*"  # get_fwd_splitkv_blobs()
         if q.dtype == dtypes.fp16:
             md_name += "_fp16"
-            filter_fwd_splitkv1 += "fp16*"
-            filter_fwd_splitkv2 += "fp16*"
+            filter_fwd_splitkv1 += "_fp16*"
+            filter_fwd_splitkv2 += "_fp16*"
         elif q.dtype == dtypes.bf16:
             md_name += "_bf16"
-            filter_fwd_splitkv1 += "bf16*"
-            filter_fwd_splitkv2 += "bf16*"
+            filter_fwd_splitkv1 += "_bf16*"
+            filter_fwd_splitkv2 += "_bf16*"
         if 0.0 < logits_soft_cap:
             md_name += "_logits"
             filter_fwd += "_logits*"
@@ -377,7 +377,7 @@ def cmdGenFunc_mha_varlen_fwd(
             filter_fwd_splitkv2 += "_nmask*"
         else:
             md_name += "_mask"
-            filter_fwd_splitkv2 += "_mask*"
+            filter_fwd_splitkv2 += "_m*"
         if return_softmax_lse:
             md_name += "_lse"
             filter_fwd_splitkv1 += "_lse*"
