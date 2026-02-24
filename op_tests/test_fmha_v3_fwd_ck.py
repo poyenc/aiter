@@ -99,15 +99,6 @@ def test_fmha_v3_fwd_ck(
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
 
-
-    def print_tensor(tensor, tensor_name):
-        tensor_list = tensor.tolist()
-
-        for i, row in enumerate(tensor_list):
-            formatted_row = ", ".join("{:5.2f}".format(x) for x in row)
-            print("[HOST] {0}[{1:3}] = {2}".format(tensor_name, i, formatted_row))
-        sys.stdout.flush()
-
     q = torch.randn(
         batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype, requires_grad=False
     )
@@ -129,23 +120,7 @@ def test_fmha_v3_fwd_ck(
         dtype=dtype,
         requires_grad=False,
     )
-    # print(f'{q.shape=}')
-    # print(f'{k.shape=}')
-    # print(f'{v.shape=}')
 
-    def save_tensor(tensor, fname):
-        tensor_np = tensor.cpu().numpy()
-        tensor_np.tofile(fname)
-
-    # save_tensor(q.squeeze(0).squeeze(1), f"q_{q.size(1)}x{q.size(3)}.bin")
-    # save_tensor(k.squeeze(0).squeeze(1), f"k_{k.size(1)}x{k.size(3)}.bin")
-    # save_tensor(v.squeeze(0).squeeze(1), f"v_{v.size(1)}x{v.size(3)}.bin")
-
-    # print_tensor(q.squeeze(0).squeeze(1), 'Q')
-    # print_tensor(k.squeeze(0).squeeze(1), 'K')
-    # print_tensor(v.squeeze(0).squeeze(1), 'V')
-
-    # attention = aiter.flash_attn_func
     attention = aiter.fmha_v3_fwd_ck_func
     if profile:
         out, time = profile_func(
@@ -156,15 +131,11 @@ def test_fmha_v3_fwd_ck(
     else:
         out = attention(q, k, v, causal=causal, logits_soft_cap=logits_soft_cap)
 
-    # print_tensor(out.squeeze(0).squeeze(1), 'O')
-
     if profile:
         return
 
     if REF_BY_TORCH:
         out_ref = run_torch(q, k, v, causal=causal, softcap=logits_soft_cap)
-
-        # print_tensor(out_ref.squeeze(0).squeeze(1), 'out_ref')
 
         out_pt = run_torch(
             q,
@@ -175,8 +146,6 @@ def test_fmha_v3_fwd_ck(
             upcast=False,
             reorder_ops=True,
         )
-
-        # print_tensor(out_pt.squeeze(0).squeeze(1), 'out_pt')
 
         print(f"Output max diff: {(out - out_ref).abs().max().item()}")
         print(f"Output Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
@@ -239,15 +208,6 @@ def test_fmha_v3_varlen_fwd_ck(
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
 
-
-    def print_tensor(tensor, tensor_name):
-        tensor_list = tensor.tolist()
-
-        for i, row in enumerate(tensor_list):
-            formatted_row = ", ".join("{:5.2f}".format(x) for x in row)
-            print("[HOST] {0}[{1:3}] = {2}".format(tensor_name, i, formatted_row))
-        sys.stdout.flush()
-
     q = torch.randn(
         batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype, requires_grad=False
     )
@@ -291,22 +251,6 @@ def test_fmha_v3_varlen_fwd_ck(
         dk_pad_fn,
     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
 
-    # print(f'{q_unpad.shape=}')
-    # print(f'{k_unpad.shape=}')
-    # print(f'{v_unpad.shape=}')
-
-    def save_tensor(tensor, fname):
-        tensor_np = tensor.cpu().numpy()
-        tensor_np.tofile(fname)
-
-    # save_tensor(q.squeeze(0).squeeze(1), f"q_{q.size(1)}x{q.size(3)}.bin")
-    # save_tensor(k.squeeze(0).squeeze(1), f"k_{k.size(1)}x{k.size(3)}.bin")
-    # save_tensor(v.squeeze(0).squeeze(1), f"v_{v.size(1)}x{v.size(3)}.bin")
-
-    # print_tensor(q.squeeze(0).squeeze(1), 'Q')
-    # print_tensor(k.squeeze(0).squeeze(1), 'K')
-    # print_tensor(v.squeeze(0).squeeze(1), 'V')
-
     attention = aiter.fmha_v3_varlen_fwd_ck_func
     if profile:
         out, time = profile_func(
@@ -336,8 +280,6 @@ def test_fmha_v3_varlen_fwd_ck(
             logits_soft_cap=logits_soft_cap,
         )
 
-    # print_tensor(out.squeeze(0).squeeze(1), 'O')
-
     if profile:
         return
 
@@ -352,8 +294,6 @@ def test_fmha_v3_varlen_fwd_ck(
             softcap=logits_soft_cap,
         )
 
-        # print_tensor(out_ref.squeeze(0).squeeze(1), 'out_ref')
-
         out_pt = run_torch(
             q,
             k,
@@ -366,7 +306,6 @@ def test_fmha_v3_varlen_fwd_ck(
             reorder_ops=True,
         )
 
-        # print_tensor(out_pt.squeeze(0).squeeze(1), 'out_pt')
         out = output_pad_fn(out)
         print(f"Output max diff: {(out - out_ref).abs().max().item()}")
         print(f"Output Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
@@ -374,7 +313,6 @@ def test_fmha_v3_varlen_fwd_ck(
             out_pt - out_ref
         ).abs().max().item()
     else:
-
         if REF_BY_TRITON:
             out_ref, _ = flash_attn_varlen_func(
                 q_unpad,
