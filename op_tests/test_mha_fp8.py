@@ -411,6 +411,7 @@ def test_flash_attn_output(
         batch_size
         * nheads
         * (seqlen_q * seqlen_k * d * 2 + seqlen_q * seqlen_k * d_v * 2)
+        // (2 if causal else 1)
     )
 
     quant_dtype_bytes = torch.finfo(quant_dtype).bits // 8
