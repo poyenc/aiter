@@ -1010,7 +1010,7 @@ def cmdGenFunc_mha_batch_prefill(
         filter_fwd += "_nmask*"
     else:
         md_name += "_mask"
-        filter_fwd += "_mask*"
+        filter_fwd += "_m*"
     if return_softmax_lse:
         md_name += "_lse"
         filter_fwd += "_lse*"
