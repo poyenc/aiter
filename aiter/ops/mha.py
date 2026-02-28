@@ -2921,6 +2921,7 @@ def flash_attn_fp8_pertensor_func(
     causal=False,
     window_size=(-1, -1, 0),  # -1 means infinite context window, 0 means no sink
     softmax_scale=None,
+    logits_soft_cap=0.0,
     sink_ptr=None,
 ):
     if softmax_scale is None:
@@ -2938,7 +2939,7 @@ def flash_attn_fp8_pertensor_func(
         v,
         0.0,
         softmax_scale,
-        0.0,
+        logits_soft_cap,
         causal=causal,
         window_size_left=int(window_size[0]),
         window_size_right=int(window_size[1]),
