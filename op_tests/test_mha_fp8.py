@@ -24,6 +24,7 @@ def attention_fp8_ref_online(
     v_descale: float,
     causal=False,
     window_size=(-1, -1),
+    logits_soft_cap=0.0,
     kv_tile_size=128,
 ):
     """
@@ -56,15 +57,25 @@ def attention_fp8_ref_online(
 
     # scale_s = (1/sqrt(d)) * log2(e) * q_descale * k_descale
     scale_s = (1.0 / math.sqrt(d)) * log2e * q_descale * k_descale
+    raw_scale = (1.0 / math.sqrt(d)) * q_descale * k_descale
     scale_p = fp8_max
 
     # Initialize online softmax state
     # m: row max (for numerical stability), shape [batch, nheads, seqlen_q]
     # l: row sum of exp, shape [batch, nheads, seqlen_q]
     # o_acc: output accumulator, shape [batch, seqlen_q, nheads, d_v]
-    m = torch.full((batch_size, nheads, seqlen_q), float("-inf"), device=q_fp8.device, dtype=torch.float32)
-    l = torch.zeros((batch_size, nheads, seqlen_q), device=q_fp8.device, dtype=torch.float32)
-    o_acc = torch.zeros((batch_size, seqlen_q, nheads, d_v), device=q_fp8.device, dtype=torch.float32)
+    m = torch.full(
+        (batch_size, nheads, seqlen_q),
+        float("-inf"),
+        device=q_fp8.device,
+        dtype=torch.float32,
+    )
+    l = torch.zeros(
+        (batch_size, nheads, seqlen_q), device=q_fp8.device, dtype=torch.float32
+    )
+    o_acc = torch.zeros(
+        (batch_size, seqlen_q, nheads, d_v), device=q_fp8.device, dtype=torch.float32
+    )
 
     num_kv_tiles = (seqlen_k + kv_tile_size - 1) // kv_tile_size
 
@@ -80,10 +91,23 @@ def attention_fp8_ref_online(
         # scores: [batch, nheads, seqlen_q, tile_len]
         scores = torch.einsum("bthd,bshd->bhts", q, k_tile)
 
+        # Apply logits soft cap (before masking, on natural-scale logits)
+        if logits_soft_cap > 0.0:
+            raw_scores = scores * raw_scale
+            raw_scores = logits_soft_cap * torch.tanh(raw_scores / logits_soft_cap)
+            scores = raw_scores * log2e
+            use_scale_s = 1.0
+        else:
+            use_scale_s = scale_s
+
         # Apply causal mask for this tile
         if window_size[0] >= 0 or window_size[1] >= 0:
-            row_idx = torch.arange(seqlen_q, device=q_fp8.device, dtype=torch.long).view(-1, 1)
-            col_idx = torch.arange(kv_start, kv_end, device=q_fp8.device, dtype=torch.long)
+            row_idx = torch.arange(
+                seqlen_q, device=q_fp8.device, dtype=torch.long
+            ).view(-1, 1)
+            col_idx = torch.arange(
+                kv_start, kv_end, device=q_fp8.device, dtype=torch.long
+            )
             if window_size[0] < 0:
                 # Causal only
                 mask = col_idx > row_idx + seqlen_k - seqlen_q + window_size[1]
@@ -99,7 +123,9 @@ def attention_fp8_ref_online(
         m_tile = scores.max(dim=-1).values  # [batch, nheads, seqlen_q]
 
         # Handle fully masked rows
-        m_tile = torch.where(torch.isinf(m_tile), torch.full_like(m_tile, float("-inf")), m_tile)
+        m_tile = torch.where(
+            torch.isinf(m_tile), torch.full_like(m_tile, float("-inf")), m_tile
+        )
 
         # New global max
         m_new = torch.maximum(m, m_tile)
@@ -107,13 +133,13 @@ def attention_fp8_ref_online(
         m_new = torch.where(torch.isinf(m_new), torch.zeros_like(m_new), m_new)
 
         # Rescaling factors
-        # alpha = exp2(scale_s * (m_old - m_new)) - rescale old accumulator
+        # alpha = exp2(use_scale_s * (m_old - m_new)) - rescale old accumulator
         # For rows where m was -inf, alpha should be 0
-        alpha = torch.exp2(scale_s * (m - m_new))
+        alpha = torch.exp2(use_scale_s * (m - m_new))
         alpha = torch.where(torch.isinf(m), torch.zeros_like(alpha), alpha)
 
-        # Compute P = exp2(scale_s * (scores - m_new))
-        p_compute = torch.exp2(scale_s * (scores - m_new.unsqueeze(-1)))
+        # Compute P = exp2(use_scale_s * (scores - m_new))
+        p_compute = torch.exp2(use_scale_s * (scores - m_new.unsqueeze(-1)))
 
         # Step 3: Rescale o_acc by alpha
         # o_acc shape: [batch, seqlen_q, nheads, d_v]
@@ -261,6 +287,156 @@ def attention_fp8_ref(
     return output
 
 
+def attention_varlen_fp8_ref_online(
+    q_fp8,
+    k_fp8,
+    v_fp8,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    q_descale: float,
+    k_descale: float,
+    v_descale: float,
+    causal=False,
+    logits_soft_cap=0.0,
+    kv_tile_size=128,
+):
+    """
+    Reference implementation simulating online softmax with KV tiling for varlen.
+
+    Processes each sequence independently (group_mode), same FP8 computation
+    flow as the kernel (FAST_EXP2 path with online softmax).
+
+    Arguments:
+        q_fp8: (total_q, nheads, head_dim) - fp8 quantized query
+        k_fp8: (total_k, nheads_k, head_dim) - fp8 quantized key
+        v_fp8: (total_k, nheads_k, head_dim) - fp8 quantized value
+        cu_seqlens_q: (batch_size + 1,) cumulative Q sequence lengths
+        cu_seqlens_k: (batch_size + 1,) cumulative K sequence lengths
+        q_descale, k_descale, v_descale: per-tensor descale factors (scalar)
+        causal: whether to apply causal masking
+        logits_soft_cap: soft cap for logits (0.0 = disabled)
+        kv_tile_size: tile size for KV dimension in online softmax
+
+    Returns:
+        output: (total_q, nheads, head_dim) - bf16
+    """
+    nheads = q_fp8.shape[1]
+    nheads_k = k_fp8.shape[1]
+    d = q_fp8.shape[2]
+    batch_size = len(cu_seqlens_q) - 1
+
+    fp8_max = torch.finfo(dtypes.fp8).max
+    log2e = math.log2(math.e)
+
+    scale_s = (1.0 / math.sqrt(d)) * log2e * q_descale * k_descale
+    scale_p = fp8_max
+    gqa_ratio = nheads // nheads_k
+
+    total_q = q_fp8.shape[0]
+    output = torch.zeros(total_q, nheads, d, dtype=torch.bfloat16, device=q_fp8.device)
+
+    for b in range(batch_size):
+        q_start = cu_seqlens_q[b].item()
+        q_end = cu_seqlens_q[b + 1].item()
+        k_start = cu_seqlens_k[b].item()
+        k_end = cu_seqlens_k[b + 1].item()
+        seqlen_q = q_end - q_start
+        seqlen_k = k_end - k_start
+
+        # Dequantize
+        q = q_fp8[q_start:q_end].float()  # [sq, h, d]
+        k = k_fp8[k_start:k_end].float()  # [sk, hk, d]
+        v = v_fp8[k_start:k_end].float()  # [sk, hk, d]
+
+        # GQA expansion
+        if gqa_ratio > 1:
+            k = repeat(k, "s h d -> s (h g) d", g=gqa_ratio)
+            v = repeat(v, "s h d -> s (h g) d", g=gqa_ratio)
+
+        # Initialize online softmax state for this sequence
+        m = torch.full(
+            (nheads, seqlen_q), float("-inf"), device=q_fp8.device, dtype=torch.float32
+        )
+        l = torch.zeros((nheads, seqlen_q), device=q_fp8.device, dtype=torch.float32)
+        o_acc = torch.zeros(
+            (seqlen_q, nheads, d), device=q_fp8.device, dtype=torch.float32
+        )
+
+        num_kv_tiles = (seqlen_k + kv_tile_size - 1) // kv_tile_size
+
+        for tile_idx in range(num_kv_tiles):
+            kv_start = tile_idx * kv_tile_size
+            kv_end = min(kv_start + kv_tile_size, seqlen_k)
+
+            k_tile = k[kv_start:kv_end]  # [tile_len, h, d]
+            v_tile = v[kv_start:kv_end]  # [tile_len, h, d]
+
+            # QK^T: [h, sq, tile_len]
+            scores = torch.einsum("qhd,khd->hqk", q, k_tile)
+
+            # Logits soft cap (applied before exp2 scaling)
+            if logits_soft_cap > 0.0:
+                raw_scale = (1.0 / math.sqrt(d)) * q_descale * k_descale
+                raw_scores = scores * raw_scale
+                raw_scores = logits_soft_cap * torch.tanh(raw_scores / logits_soft_cap)
+                # Convert to log2 scale for exp2
+                scores_scaled = raw_scores * log2e
+                use_scale_s = 1.0
+            else:
+                scores_scaled = scores
+                use_scale_s = scale_s
+
+            # Causal mask
+            if causal:
+                row_idx = torch.arange(
+                    seqlen_q, device=q_fp8.device, dtype=torch.long
+                ).view(-1, 1)
+                col_idx = torch.arange(
+                    kv_start, kv_end, device=q_fp8.device, dtype=torch.long
+                )
+                mask = col_idx > row_idx + seqlen_k - seqlen_q
+                scores_scaled.masked_fill_(mask, float("-inf"))
+
+            # Online softmax update
+            m_tile = scores_scaled.max(dim=-1).values  # [h, sq]
+            m_tile = torch.where(
+                torch.isinf(m_tile), torch.full_like(m_tile, float("-inf")), m_tile
+            )
+
+            m_new = torch.maximum(m, m_tile)
+            m_new = torch.where(torch.isinf(m_new), torch.zeros_like(m_new), m_new)
+
+            alpha = torch.exp2(use_scale_s * (m - m_new))
+            alpha = torch.where(torch.isinf(m), torch.zeros_like(alpha), alpha)
+
+            p_compute = torch.exp2(use_scale_s * (scores_scaled - m_new.unsqueeze(-1)))
+
+            # Rescale o_acc: [sq, h, d] *= alpha [h, sq] -> [sq, h, 1]
+            alpha_for_o = alpha.permute(1, 0).unsqueeze(-1)
+            o_acc = o_acc * alpha_for_o
+
+            l = l * alpha + p_compute.sum(dim=-1)
+
+            # Quantize P to fp8
+            p_fp8 = (p_compute * scale_p).to(dtypes.fp8)
+            p_dequant = p_fp8.float()
+
+            # PV: [h, sq, tile_len] @ [tile_len, h, d] -> [sq, h, d]
+            o_tile = torch.einsum("hqk,khd->qhd", p_dequant, v_tile)
+            o_acc = o_acc + o_tile
+
+            m = m_new
+
+        # Final normalization
+        l_for_div = l.permute(1, 0).unsqueeze(-1).clamp(min=1e-9)  # [sq, h, 1]
+        o_seq = o_acc / l_for_div
+
+        scale_o = v_descale / scale_p
+        output[q_start:q_end] = (o_seq * scale_o).to(torch.bfloat16)
+
+    return output
+
+
 @perftest()
 def profile_func(target_func, *args, **kwargs):
     return target_func(*args, **kwargs)
@@ -275,14 +451,22 @@ def run_ck(
     q_descale=None,
     k_descale=None,
     v_descale=None,
+    logits_soft_cap=0.0,
     profile=False,
 ):
     if q.dtype == dtypes.fp8 and k.dtype == dtypes.fp8 and v.dtype == dtypes.fp8:
         if profile:
             return profile_func(
                 aiter.flash_attn_fp8_pertensor_func,
-                q, k, v, q_descale, k_descale, v_descale,
-                causal=causal, window_size=window_size,
+                q,
+                k,
+                v,
+                q_descale,
+                k_descale,
+                v_descale,
+                causal=causal,
+                window_size=window_size,
+                logits_soft_cap=logits_soft_cap,
             )
         return run_perftest(
             aiter.flash_attn_fp8_pertensor_func,
@@ -294,6 +478,7 @@ def run_ck(
             v_descale,
             causal=causal,
             window_size=window_size,
+            logits_soft_cap=logits_soft_cap,
             num_iters=2,
             num_warmup=0,
         )
@@ -301,9 +486,18 @@ def run_ck(
         if profile:
             return profile_func(
                 aiter.flash_attn_func,
-                q, k, v, dropout_p=0.0, causal=causal, window_size=window_size,
-                bias=None, alibi_slopes=None, deterministic=True,
-                return_lse=False, return_attn_probs=False,
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                causal=causal,
+                window_size=window_size,
+                logits_soft_cap=logits_soft_cap,
+                bias=None,
+                alibi_slopes=None,
+                deterministic=True,
+                return_lse=False,
+                return_attn_probs=False,
             )
         return run_perftest(
             aiter.flash_attn_func,
@@ -313,6 +507,7 @@ def run_ck(
             dropout_p=0.0,
             causal=causal,
             window_size=window_size,
+            logits_soft_cap=logits_soft_cap,
             bias=None,
             alibi_slopes=None,
             deterministic=True,
@@ -323,7 +518,93 @@ def run_ck(
         )
 
 
+def run_ck_varlen(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    causal=False,
+    logits_soft_cap=0.0,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    profile=False,
+):
+    if q.dtype == dtypes.fp8 and k.dtype == dtypes.fp8 and v.dtype == dtypes.fp8:
+        if profile:
+            return profile_func(
+                aiter.flash_attn_varlen_fp8_pertensor_func,
+                q,
+                k,
+                v,
+                q_descale,
+                k_descale,
+                v_descale,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                min_seqlen_q=0,
+                causal=causal,
+                logits_soft_cap=logits_soft_cap,
+                window_size=(-1, -1),
+            )
+        return run_perftest(
+            aiter.flash_attn_varlen_fp8_pertensor_func,
+            q,
+            k,
+            v,
+            q_descale,
+            k_descale,
+            v_descale,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            min_seqlen_q=0,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+            window_size=(-1, -1),
+            num_iters=2,
+            num_warmup=0,
+        )
+    else:
+        if profile:
+            return profile_func(
+                aiter.flash_attn_varlen_func,
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                causal=causal,
+                logits_soft_cap=logits_soft_cap,
+                return_lse=False,
+            )
+        return run_perftest(
+            aiter.flash_attn_varlen_func,
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+            return_lse=False,
+            num_iters=2,
+            num_warmup=0,
+        )
+
+
 # @pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
 @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("batch_size", [1, 8])
@@ -350,8 +631,17 @@ def run_ck(
         (4096, 4096),
     ],
 )
-def test_flash_attn_output(
-    batch_size, nheads, nheads_k, seqlen_q, seqlen_k, d, d_v, causal, local,
+def test_flash_attn_fp8_output(
+    batch_size,
+    nheads,
+    nheads_k,
+    seqlen_q,
+    seqlen_k,
+    d,
+    d_v,
+    causal,
+    local,
+    logits_soft_cap,
     kv_tile_size=128,
     profile=False,
 ):
@@ -392,20 +682,27 @@ def test_flash_attn_output(
         q_descale,
         k_descale,
         v_descale,
+        logits_soft_cap=logits_soft_cap,
         profile=profile,
     )
 
     out_ref = attention_fp8_ref_online(
-        q_quant, k_quant, v_quant,
-        q_descale.item(), k_descale.item(), v_descale.item(),
+        q_quant,
+        k_quant,
+        v_quant,
+        q_descale.item(),
+        k_descale.item(),
+        v_descale.item(),
         causal=causal,
         window_size=window_size,
+        logits_soft_cap=logits_soft_cap,
         kv_tile_size=kv_tile_size,
     )
 
     max_diff = (out - out_ref).abs().max().item()
     print(f"Output max diff: {max_diff}")
-    assert max_diff < 0.02
+    threshold = 0.025 if logits_soft_cap > 0.0 else 0.02
+    assert max_diff < threshold
 
     fwd_flop = (
         batch_size
@@ -427,9 +724,147 @@ def test_flash_attn_output(
     benchmark["quant_fwd_gb_per_sec"] = (quant_fwd_num_bytes) / 1.0e3 / us_quant_fwd
 
 
+def convert_lens_to_indptr(lens):
+    return torch.cumsum(torch.cat((torch.tensor([0]), lens)), dim=0).int()
+
+
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("batch_size", [1, 5])
+@pytest.mark.parametrize("nheads, nheads_k", [(8, 1), (40, 8), (32, 8), (5, 1)])
+@pytest.mark.parametrize(
+    "d,d_v",
+    [
+        (128, 128),
+    ],
+)
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (113, 203),
+        (128, 217),
+        (113, 211),
+        (108, 256),
+        (256, 512),
+        (512, 256),
+        (1024, 1024),
+        (1023, 1024),
+        (1024, 1023),
+        (2048, 2048),
+        (4096, 4096),
+    ],
+)
+def test_flash_attn_varlen_fp8_output(
+    batch_size,
+    nheads,
+    nheads_k,
+    seqlen_q,
+    seqlen_k,
+    d,
+    d_v,
+    causal,
+    logits_soft_cap,
+    kv_tile_size=128,
+    profile=False,
+):
+    """
+    Test flash_attn_varlen_fp8_pertensor_func against online-softmax reference.
+
+    Uses the same FP8 computation flow as test_flash_attn_fp8_output but with
+    varlen (group_mode) layout: (total_tokens, nheads, head_dim).
+    """
+    torch.random.manual_seed(0)
+    torch.cuda.empty_cache()
+    dtype = torch.bfloat16
+    quant_dtype = dtypes.fp8
+
+    # Build variable-length sequences
+    if batch_size > 1:
+        qo_lens = torch.randint(1, seqlen_q + 1, (batch_size,)).int()
+        kv_lens = torch.randint(1, seqlen_k + 1, (batch_size,)).int()
+        if causal:
+            kv_lens = torch.maximum(qo_lens, kv_lens)
+    else:
+        qo_lens = torch.full((batch_size,), seqlen_q).int()
+        kv_lens = torch.full((batch_size,), seqlen_k).int()
+
+    total_q = qo_lens.sum().item()
+    total_k = kv_lens.sum().item()
+    max_sq = qo_lens.max().item()
+    max_sk = kv_lens.max().item()
+
+    cu_seqlens_q = convert_lens_to_indptr(qo_lens).cuda()
+    cu_seqlens_k = convert_lens_to_indptr(kv_lens).cuda()
+
+    # Create BF16 tensors in varlen layout, then quantize
+    q = torch.rand(total_q, nheads, d, device="cuda", dtype=dtype)
+    k = torch.rand(total_k, nheads_k, d, device="cuda", dtype=dtype)
+    v = torch.rand(total_k, nheads_k, d_v, device="cuda", dtype=dtype)
+
+    q_quant, q_descale = per_tensor_quant(q, quant_dtype=quant_dtype)
+    k_quant, k_descale = per_tensor_quant(k, quant_dtype=quant_dtype)
+    v_quant, v_descale = per_tensor_quant(v, quant_dtype=quant_dtype)
+
+    out, us_quant_fwd = run_ck_varlen(
+        q_quant,
+        k_quant,
+        v_quant,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_sq,
+        max_sk,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        profile=profile,
+    )
+
+    out_ref = attention_varlen_fp8_ref_online(
+        q_quant,
+        k_quant,
+        v_quant,
+        cu_seqlens_q.cpu(),
+        cu_seqlens_k.cpu(),
+        q_descale.item(),
+        k_descale.item(),
+        v_descale.item(),
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        kv_tile_size=kv_tile_size,
+    )
+
+    max_diff = (out - out_ref).abs().max().item()
+    print(
+        f"Varlen FP8 | b={batch_size} sq={seqlen_q} sk={seqlen_k} "
+        f"h={nheads}/{nheads_k} causal={causal} lsc={logits_soft_cap} | "
+        f"max diff: {max_diff}"
+    )
+    assert max_diff < 0.02
+
+    fwd_flop = (
+        batch_size
+        * nheads
+        * (max_sq * max_sk * d * 2 + max_sq * max_sk * d_v * 2)
+        // (2 if causal else 1)
+    )
+
+    benchmark["varlen_quant_fwd_us"] = us_quant_fwd
+    benchmark["varlen_quant_fwd_tflops"] = (fwd_flop) / 1.0e6 / us_quant_fwd
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
+)
+parser.add_argument(
+    "--mode",
+    type=str,
+    choices=["regular", "varlen"],
+    default="regular",
+    help="""Test mode: 'regular' for dense format, 'varlen' for variable length format.
+    e.g.: --mode varlen""",
 )
 parser.add_argument(
     "-b",
@@ -452,7 +887,7 @@ parser.add_argument(
     "--nheads_k",
     type=int,
     default=-1,
-    help="""Number of heads. -1 means equal to n (nheads).
+    help="""Number of KV heads. -1 means equal to n (nheads).
     e.g.: -nk 1""",
 )
 parser.add_argument(
@@ -484,7 +919,7 @@ parser.add_argument(
     "--d_v",
     type=int,
     default=-1,
-    help="""Dimension of query and key. -1 means equal to d (d_qk).
+    help="""Dimension of value. -1 means equal to d (d_qk).
     e.g.: -dv 128""",
 )
 parser.add_argument(
@@ -502,6 +937,13 @@ parser.add_argument(
     -l or --local    # enable local attention""",
 )
 parser.add_argument(
+    "--logits_soft_cap",
+    type=float,
+    default=0.0,
+    help="""Logits soft cap. Default is 0.0 (disabled).
+    e.g.: --logits_soft_cap 30.0""",
+)
+parser.add_argument(
     "-p",
     "--profile",
     action="store_true",
@@ -516,18 +958,33 @@ if __name__ == "__main__":
     seqlen_k = args.seqlen_k if args.seqlen_k > 0 else args.seqlen_q
     d_v = args.d_v if args.d_v > 0 else args.d_qk
 
-    test_flash_attn_output(
-        args.batch_size,
-        args.nheads,
-        nheads_k,
-        args.seqlen_q,
-        seqlen_k,
-        args.d_qk,
-        d_v,
-        args.causal,
-        args.local,
-        profile=args.profile,
-    )
+    if args.mode == "regular":
+        test_flash_attn_fp8_output(
+            args.batch_size,
+            args.nheads,
+            nheads_k,
+            args.seqlen_q,
+            seqlen_k,
+            args.d_qk,
+            d_v,
+            args.causal,
+            args.local,
+            args.logits_soft_cap,
+            profile=args.profile,
+        )
+    elif args.mode == "varlen":
+        test_flash_attn_varlen_fp8_output(
+            args.batch_size,
+            args.nheads,
+            nheads_k,
+            args.seqlen_q,
+            seqlen_k,
+            args.d_qk,
+            d_v,
+            args.causal,
+            args.logits_soft_cap,
+            profile=args.profile,
+        )
 
     df = pd.DataFrame([benchmark])
     aiter.logger.info(f"mha summary:\n{df}")
