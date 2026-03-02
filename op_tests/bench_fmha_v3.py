@@ -1,0 +1,505 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""
+Benchmark CK FMHA V3 kernels across all three paths:
+  1. batch_prefill  — paged KV (linear + sglang, page_size=1)
+  2. fmha_regular   — contiguous KV, batch/group mode (FP8 per-tensor)
+  3. fmha_varlen    — contiguous KV, variable-length mode
+
+Supports BF16 and FP8 input dtypes. Reports time (us) and TFlops.
+
+Usage:
+    # Single problem size
+    python op_tests/bench_fmha_v3.py -b 1 -n 6 -nk 1 -q 1024 -c --dtype fp8
+
+    # Compare all three modes side-by-side
+    python op_tests/bench_fmha_v3.py -b 1 -n 6 -nk 1 -q 4096 -c --dtype fp8 --mode all
+
+    # Batch prefill only
+    python op_tests/bench_fmha_v3.py -b 1 -n 6 -nk 1 -q 4096 -c --dtype bf16 --mode batch_prefill
+
+    # Sweep predefined problem sizes
+    python op_tests/bench_fmha_v3.py --sweep --dtype fp8
+"""
+
+import argparse
+import torch
+
+import aiter
+from aiter import dtypes
+from aiter import per_tensor_quant
+from aiter.test_common import perftest
+
+from aiter.test_mha_common import (
+    generate_random_padding_mask,
+    generate_qkv,
+)
+
+from test_batch_prefill import (
+    build_paged_kv_cache,
+    convert_lens_to_indptr,
+    split_kv_pages,
+)
+
+
+@perftest()
+def profile_func(target_func, *args, **kwargs):
+    return target_func(*args, **kwargs)
+
+
+def flops(batch, seqlen_q, seqlen_k, headdim, nheads_q, nheads_k, causal):
+    mask_area = seqlen_q * seqlen_k // (2 if causal else 1)
+    qk = 2 * batch * mask_area * nheads_q * headdim
+    pv = 2 * batch * mask_area * nheads_q * headdim
+    return qk + pv
+
+
+def tflops(flop, time_us):
+    return flop / time_us / 1e6
+
+
+def run_batch_prefill(
+    batch_size,
+    nheads,
+    nheads_k,
+    seqlen_q,
+    seqlen_k,
+    head_dim,
+    causal,
+    logits_soft_cap,
+    is_fp8,
+):
+    # Match fmha_varlen: padded Q + random padding mask + unpad
+    dtype = torch.bfloat16
+    page_size = 1
+
+    q_padded = torch.randn(
+        batch_size, seqlen_q, nheads, head_dim, device="cuda", dtype=dtype
+    )
+    query_padding_mask = generate_random_padding_mask(
+        seqlen_q, batch_size, "cuda", mode="random"
+    )
+    qo_lens = query_padding_mask.sum(dim=-1).to(torch.int32).cpu()
+    total_q = qo_lens.sum().item()
+    # Unpad Q: select valid tokens per sequence
+    q = torch.cat(
+        [q_padded[i, : qo_lens[i]] for i in range(batch_size)], dim=0
+    )  # [total_q, nheads, head_dim]
+
+    kv_lens = torch.full((batch_size,), seqlen_k).int()
+
+    kv_cache = build_paged_kv_cache(
+        batch_size,
+        seqlen_k,
+        page_size,
+        nheads_k,
+        head_dim,
+        kv_lens,
+        None if is_fp8 else -5,
+        None if is_fp8 else 5,
+        dtype,
+        use_uniform=is_fp8,
+        contiguous_kv=True,
+    )
+
+    q_indptr = convert_lens_to_indptr(qo_lens).cuda()
+    kv_indptr = kv_cache["kv_indptr_cpu"].cuda()
+    kv_indices = kv_cache["kv_indices_cpu"].cuda()
+    kv_last_page_len = kv_cache["kv_last_page_len_cpu"].cuda()
+
+    k_cache_ref, v_cache_ref = split_kv_pages(kv_cache["kv_data"])
+    k_cache = k_cache_ref.contiguous()
+    v_cache = v_cache_ref.contiguous()
+
+    if is_fp8:
+        q_quant, q_descale = per_tensor_quant(q, quant_dtype=dtypes.fp8)
+        k_quant, k_descale = per_tensor_quant(k_cache.to(dtype), quant_dtype=dtypes.fp8)
+        v_quant, v_descale = per_tensor_quant(v_cache.to(dtype), quant_dtype=dtypes.fp8)
+        q_quant, q_descale = q_quant.detach(), q_descale.detach()
+        k_quant, k_descale = k_quant.detach(), k_descale.detach()
+        v_quant, v_descale = v_quant.detach(), v_descale.detach()
+
+        out, time_us = profile_func(
+            aiter.mha_batch_prefill_func,
+            q_quant,
+            k_quant,
+            v_quant,
+            q_indptr,
+            kv_indptr,
+            kv_indices,
+            seqlen_q,
+            seqlen_k,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            kv_last_page_lens=kv_last_page_len,
+        )
+    else:
+        out, time_us = profile_func(
+            aiter.mha_batch_prefill_func,
+            q,
+            k_cache,
+            v_cache,
+            q_indptr,
+            kv_indptr,
+            kv_indices,
+            seqlen_q,
+            seqlen_k,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+            kv_last_page_lens=kv_last_page_len,
+        )
+
+    return time_us
+
+
+def run_fmha_regular(
+    batch_size,
+    nheads,
+    nheads_k,
+    seqlen_q,
+    seqlen_k,
+    head_dim,
+    causal,
+    logits_soft_cap,
+    is_fp8,
+):
+    dtype = torch.bfloat16
+
+    q = torch.randn(
+        batch_size, seqlen_q, nheads, head_dim, device="cuda", dtype=dtype
+    )
+    k = torch.randn(
+        batch_size, seqlen_k, nheads_k, head_dim, device="cuda", dtype=dtype
+    )
+    v = torch.randn(
+        batch_size, seqlen_k, nheads_k, head_dim, device="cuda", dtype=dtype
+    )
+
+    if is_fp8:
+        q_quant, q_descale = per_tensor_quant(q, quant_dtype=dtypes.fp8)
+        k_quant, k_descale = per_tensor_quant(k, quant_dtype=dtypes.fp8)
+        v_quant, v_descale = per_tensor_quant(v, quant_dtype=dtypes.fp8)
+        q_quant, q_descale = q_quant.detach(), q_descale.detach()
+        k_quant, k_descale = k_quant.detach(), k_descale.detach()
+        v_quant, v_descale = v_quant.detach(), v_descale.detach()
+
+        out, time_us = profile_func(
+            aiter.flash_attn_fp8_pertensor_func,
+            q_quant,
+            k_quant,
+            v_quant,
+            q_descale,
+            k_descale,
+            v_descale,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+        )
+    else:
+        out, time_us = profile_func(
+            aiter.fmha_v3_fwd_ck_func,
+            q,
+            k,
+            v,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+        )
+
+    return time_us
+
+
+def convert_lens_to_indptr(lens):
+    return torch.cumsum(torch.cat((torch.tensor([0]), lens)), dim=0).int()
+
+
+def run_fmha_varlen(
+    batch_size,
+    nheads,
+    nheads_k,
+    seqlen_q,
+    seqlen_k,
+    head_dim,
+    causal,
+    logits_soft_cap,
+    is_fp8,
+):
+    dtype = torch.bfloat16
+
+    if is_fp8:
+        # Match test_mha_fp8.py: create tensors directly in varlen layout
+        qo_lens = torch.full((batch_size,), seqlen_q).int()
+        kv_lens = torch.full((batch_size,), seqlen_k).int()
+        total_q = qo_lens.sum().item()
+        total_k = kv_lens.sum().item()
+
+        cu_seqlens_q = convert_lens_to_indptr(qo_lens).cuda()
+        cu_seqlens_k = convert_lens_to_indptr(kv_lens).cuda()
+
+        q = torch.rand(total_q, nheads, head_dim, device="cuda", dtype=dtype)
+        k = torch.rand(total_k, nheads_k, head_dim, device="cuda", dtype=dtype)
+        v = torch.rand(total_k, nheads_k, head_dim, device="cuda", dtype=dtype)
+
+        q_quant, q_descale = per_tensor_quant(q, quant_dtype=dtypes.fp8)
+        k_quant, k_descale = per_tensor_quant(k, quant_dtype=dtypes.fp8)
+        v_quant, v_descale = per_tensor_quant(v, quant_dtype=dtypes.fp8)
+        q_quant, q_descale = q_quant.detach(), q_descale.detach()
+        k_quant, k_descale = k_quant.detach(), k_descale.detach()
+        v_quant, v_descale = v_quant.detach(), v_descale.detach()
+
+        out, time_us = profile_func(
+            aiter.flash_attn_varlen_fp8_pertensor_func,
+            q_quant,
+            k_quant,
+            v_quant,
+            q_descale,
+            k_descale,
+            v_descale,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q=seqlen_q,
+            max_seqlen_k=seqlen_k,
+            min_seqlen_q=0,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+        )
+    else:
+        # BF16: keep padded tensors + random padding mask + unpad (match test_fmha_v3_fwd_ck.py)
+        q = torch.randn(
+            batch_size, seqlen_q, nheads, head_dim, device="cuda", dtype=dtype
+        )
+        k = torch.randn(
+            batch_size, seqlen_k, nheads_k, head_dim, device="cuda", dtype=dtype
+        )
+        v = torch.randn(
+            batch_size, seqlen_k, nheads_k, head_dim, device="cuda", dtype=dtype
+        )
+
+        query_padding_mask = generate_random_padding_mask(
+            seqlen_q, batch_size, "cuda", mode="random"
+        )
+        key_padding_mask = generate_random_padding_mask(
+            seqlen_k, batch_size, "cuda", mode="random"
+        )
+        (
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            q,
+            k,
+            v,
+            output_pad_fn,
+            dq_pad_fn,
+            dk_pad_fn,
+        ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+
+        out, time_us = profile_func(
+            aiter.fmha_v3_varlen_fwd_ck_func,
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+        )
+
+    return time_us
+
+
+MODE_RUNNERS = {
+    "batch_prefill": run_batch_prefill,
+    "fmha_regular": run_fmha_regular,
+    "fmha_varlen": run_fmha_varlen,
+}
+
+ALL_MODES = ["batch_prefill", "fmha_regular", "fmha_varlen"]
+
+
+def print_header():
+    print(f"{'Mode':<16} {'Dtype':<5} {'Problem':<45} {'Time(us)':>10} {'TFlops':>8}")
+    print("-" * 88)
+
+
+def print_row(mode, dtype_str, problem_str, time_us, tf):
+    print(f"{mode:<16} {dtype_str:<5} {problem_str:<45} {time_us:>10.1f} {tf:>8.1f}")
+
+
+def problem_str(batch_size, nheads, nheads_k, seqlen_q, seqlen_k, causal, lsc):
+    c = "c" if causal else "nc"
+    lsc_str = f" lsc={lsc}" if lsc > 0 else ""
+    return (
+        f"b={batch_size} h={nheads}/{nheads_k} sq={seqlen_q} sk={seqlen_k} {c}{lsc_str}"
+    )
+
+
+def run_sweep(dtype_str, modes):
+    sweep_configs = [
+        # (batch, nheads, nheads_k, seqlen_q, seqlen_k, causal, logits_soft_cap)
+        (1, 6, 1, 1024, 1024, True, 0.0),
+        (1, 6, 1, 2048, 2048, True, 0.0),
+        (1, 6, 1, 4096, 4096, True, 0.0),
+        (1, 6, 1, 8192, 8192, True, 0.0),
+        (1, 6, 1, 16384, 16384, True, 0.0),
+        (1, 6, 1, 32768, 32768, True, 0.0),
+        (1, 6, 1, 65536, 65536, True, 0.0),
+        (1, 6, 1, 131072, 131072, True, 0.0),
+        (1, 16, 1, 65536, 65536, True, 0.0),
+        (1, 40, 40, 37200, 37200, False, 0.0),
+    ]
+
+    print_header()
+    for b, n, nk, sq, sk, causal, lsc in sweep_configs:
+        ps = problem_str(b, n, nk, sq, sk, causal, lsc)
+        is_fp8 = dtype_str == "fp8"
+        for mode in modes:
+            torch.manual_seed(0)
+            torch.cuda.empty_cache()
+            time_us = MODE_RUNNERS[mode](
+                b, n, nk, sq, sk, 128, causal, lsc, is_fp8
+            )
+            tf = tflops(flops(b, sq, sk, 128, n, nk, causal), time_us)
+            print_row(mode, dtype_str, ps, time_us, tf)
+        if len(modes) > 1:
+            print()
+
+
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="Benchmark CK FMHA V3 kernels (batch_prefill / fmha_regular / fmha_varlen)",
+)
+parser.add_argument(
+    "--mode",
+    type=str,
+    choices=["batch_prefill", "fmha_regular", "fmha_varlen", "all"],
+    default="all",
+    help="""Kernel mode to benchmark. Default is 'all'.
+    batch_prefill  — paged KV (linear+sglang, page_size=1)
+    fmha_regular   — contiguous KV, batch/group mode
+    fmha_varlen    — contiguous KV, variable-length mode
+    all            — run all three and compare""",
+)
+parser.add_argument(
+    "-b",
+    "--batch_size",
+    type=int,
+    default=1,
+    help="Batch size. Default is 1.",
+)
+parser.add_argument(
+    "-n",
+    "--nheads",
+    type=int,
+    default=8,
+    help="Number of query heads. Default is 8.",
+)
+parser.add_argument(
+    "-nk",
+    "--nheads_k",
+    type=int,
+    default=-1,
+    help="Number of KV heads. -1 means equal to nheads.",
+)
+parser.add_argument(
+    "-q",
+    "--seqlen_q",
+    type=int,
+    default=1024,
+    help="Sequence length for query. Default is 1024.",
+)
+parser.add_argument(
+    "-k",
+    "--seqlen_k",
+    type=int,
+    default=-1,
+    help="Sequence length for key. -1 means equal to seqlen_q.",
+)
+parser.add_argument(
+    "-d",
+    "--head_dim",
+    type=int,
+    default=128,
+    help="Head dimension. Default is 128.",
+)
+parser.add_argument(
+    "-c",
+    "--causal",
+    action="store_true",
+    help="Enable causal attention.",
+)
+parser.add_argument(
+    "--logits_soft_cap",
+    type=float,
+    default=0.0,
+    help="Logits soft cap. Default is 0.0 (disabled).",
+)
+parser.add_argument(
+    "--dtype",
+    type=str,
+    choices=["bf16", "fp8"],
+    default="bf16",
+    help="Input dtype. Default is bf16.",
+)
+parser.add_argument(
+    "--sweep",
+    action="store_true",
+    help="Run predefined sweep of problem sizes.",
+)
+
+if __name__ == "__main__":
+    args = parser.parse_args()
+
+    nheads_k = args.nheads_k if args.nheads_k > 0 else args.nheads
+    seqlen_k = args.seqlen_k if args.seqlen_k > 0 else args.seqlen_q
+
+    modes = ALL_MODES if args.mode == "all" else [args.mode]
+
+    if args.sweep:
+        run_sweep(args.dtype, modes)
+    else:
+        ps = problem_str(
+            args.batch_size,
+            args.nheads,
+            nheads_k,
+            args.seqlen_q,
+            seqlen_k,
+            args.causal,
+            args.logits_soft_cap,
+        )
+        is_fp8 = args.dtype == "fp8"
+        print_header()
+        for mode in modes:
+            torch.manual_seed(0)
+            torch.cuda.empty_cache()
+            time_us = MODE_RUNNERS[mode](
+                args.batch_size,
+                args.nheads,
+                nheads_k,
+                args.seqlen_q,
+                seqlen_k,
+                args.head_dim,
+                args.causal,
+                args.logits_soft_cap,
+                is_fp8,
+            )
+            tf = tflops(
+                flops(
+                    args.batch_size,
+                    args.seqlen_q,
+                    seqlen_k,
+                    args.head_dim,
+                    args.nheads,
+                    nheads_k,
+                    args.causal,
+                ),
+                time_us,
+            )
+            print_row(mode, args.dtype, ps, time_us, tf)
