@@ -82,6 +82,7 @@ def run_batch_prefill(
     )
     qo_lens = query_padding_mask.sum(dim=-1).to(torch.int32).cpu()
     total_q = qo_lens.sum().item()
+    max_qo_len = qo_lens.max().item()
     # Unpad Q: select valid tokens per sequence
     q = torch.cat(
         [q_padded[i, : qo_lens[i]] for i in range(batch_size)], dim=0
@@ -128,7 +129,7 @@ def run_batch_prefill(
             q_indptr,
             kv_indptr,
             kv_indices,
-            seqlen_q,
+            max_qo_len,
             seqlen_k,
             causal=causal,
             logits_soft_cap=logits_soft_cap,
@@ -146,7 +147,7 @@ def run_batch_prefill(
             q_indptr,
             kv_indptr,
             kv_indices,
-            seqlen_q,
+            max_qo_len,
             seqlen_k,
             causal=causal,
             logits_soft_cap=logits_soft_cap,
