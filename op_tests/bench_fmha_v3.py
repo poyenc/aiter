@@ -40,6 +40,7 @@ from test_batch_prefill import (
     build_paged_kv_cache,
     convert_lens_to_indptr,
     split_kv_pages,
+    per_page_quant,
 )
 
 
@@ -153,6 +154,101 @@ def run_batch_prefill(
             logits_soft_cap=logits_soft_cap,
             kv_last_page_lens=kv_last_page_len,
         )
+
+    return time_us
+
+
+def run_batch_prefill_blockscale(
+    batch_size,
+    nheads,
+    nheads_k,
+    seqlen_q,
+    seqlen_k,
+    head_dim,
+    causal,
+    logits_soft_cap,
+    is_fp8,
+):
+    assert is_fp8, "kv_blockscale only supports fp8"
+    dtype = torch.bfloat16
+    page_size = 1024
+
+    q_padded = torch.randn(
+        batch_size, seqlen_q, nheads, head_dim, device="cuda", dtype=dtype
+    )
+    query_padding_mask = generate_random_padding_mask(
+        seqlen_q, batch_size, "cuda", mode="random"
+    )
+    qo_lens = query_padding_mask.sum(dim=-1).to(torch.int32).cpu()
+    max_qo_len = qo_lens.max().item()
+    q = torch.cat(
+        [q_padded[i, : qo_lens[i]] for i in range(batch_size)], dim=0
+    )
+
+    kv_lens = torch.full((batch_size,), seqlen_k).int()
+
+    kv_cache = build_paged_kv_cache(
+        batch_size,
+        seqlen_k,
+        page_size,
+        nheads_k,
+        head_dim,
+        kv_lens,
+        None,
+        None,
+        dtype,
+        use_uniform=True,
+        contiguous_kv=True,
+    )
+
+    q_indptr = convert_lens_to_indptr(qo_lens).cuda()
+    kv_indptr = kv_cache["kv_indptr_cpu"].cuda()
+    kv_indices = kv_cache["kv_indices_cpu"].cuda()
+    kv_last_page_len = kv_cache["kv_last_page_len_cpu"].cuda()
+
+    k_cache_ref, v_cache_ref = split_kv_pages(kv_cache["kv_data"])
+    k_cache = k_cache_ref.contiguous()
+    v_cache = v_cache_ref.contiguous()
+
+    # Per-tensor Q quantization
+    q_quant, q_descale = per_tensor_quant(q, quant_dtype=dtypes.fp8)
+    q_quant, q_descale = q_quant.detach(), q_descale.detach()
+
+    # Per-page K/V quantization
+    # k_cache/v_cache are [num_pages, page_size, nheads_k, head_dim]
+    k_paged_fp8, k_descales = per_page_quant(k_cache.to(dtype), page_size, dtypes.fp8)
+    v_paged_fp8, v_descales = per_page_quant(v_cache.to(dtype), page_size, dtypes.fp8)
+    kv_block_descale = torch.stack([k_descales, v_descales], dim=-1)
+
+    # Build block_table and seqlen_k tensor (required by kv_blockscale path)
+    max_num_pages = (seqlen_k + page_size - 1) // page_size
+    block_table = torch.zeros((batch_size, max_num_pages), dtype=torch.int32)
+    kv_indices_cpu = kv_cache["kv_indices_cpu"]
+    kv_indptr_cpu = kv_cache["kv_indptr_cpu"]
+    for i in range(batch_size):
+        start, end = kv_indptr_cpu[i].item(), kv_indptr_cpu[i + 1].item()
+        block_table[i, : (end - start)] = kv_indices_cpu[start:end]
+    block_table = block_table.cuda()
+    seqlen_k_tensor = kv_lens.cuda().int()
+
+    out, time_us = profile_func(
+        aiter.mha_batch_prefill_func,
+        q_quant,
+        k_paged_fp8,
+        v_paged_fp8,
+        q_indptr,
+        kv_indptr,
+        kv_indices,
+        max_qo_len,
+        seqlen_k,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        q_descale=q_descale,
+        kv_block_descale=kv_block_descale,
+        kv_last_page_lens=kv_last_page_len,
+        block_table=block_table,
+        seqlen_k=seqlen_k_tensor,
+    )
 
     return time_us
 
@@ -318,6 +414,7 @@ def run_fmha_varlen(
 
 MODE_RUNNERS = {
     "batch_prefill": run_batch_prefill,
+    "batch_prefill_blockscale": run_batch_prefill_blockscale,
     "fmha_regular": run_fmha_regular,
     "fmha_varlen": run_fmha_varlen,
 }
@@ -342,7 +439,7 @@ def problem_str(batch_size, nheads, nheads_k, seqlen_q, seqlen_k, causal, lsc):
     )
 
 
-def run_sweep(dtype_str, modes):
+def run_sweep(dtype_str, modes, quant="pertensor"):
     sweep_configs = [
         # (batch, nheads, nheads_k, seqlen_q, seqlen_k, causal, logits_soft_cap)
         (1, 6, 1, 1024, 1024, True, 0.0),
@@ -357,19 +454,29 @@ def run_sweep(dtype_str, modes):
         (1, 40, 40, 37200, 37200, False, 0.0),
     ]
 
+    # Remap batch_prefill mode based on quant method
+    effective_modes = []
+    for mode in modes:
+        if mode == "batch_prefill" and quant == "kv_blockscale" and dtype_str == "fp8":
+            effective_modes.append("batch_prefill_blockscale")
+        else:
+            effective_modes.append(mode)
+
     print_header()
     for b, n, nk, sq, sk, causal, lsc in sweep_configs:
         ps = problem_str(b, n, nk, sq, sk, causal, lsc)
         is_fp8 = dtype_str == "fp8"
-        for mode in modes:
+        for mode in effective_modes:
             torch.manual_seed(0)
             torch.cuda.empty_cache()
             time_us = MODE_RUNNERS[mode](
                 b, n, nk, sq, sk, 128, causal, lsc, is_fp8
             )
             tf = tflops(flops(b, sq, sk, 128, n, nk, causal), time_us)
-            print_row(mode, dtype_str, ps, time_us, tf)
-        if len(modes) > 1:
+            # Display original mode name (batch_prefill) for consistency
+            display_mode = "batch_prefill" if mode == "batch_prefill_blockscale" else mode
+            print_row(display_mode, dtype_str, ps, time_us, tf)
+        if len(effective_modes) > 1:
             print()
 
 
@@ -454,6 +561,13 @@ parser.add_argument(
     action="store_true",
     help="Run predefined sweep of problem sizes.",
 )
+parser.add_argument(
+    "--quant",
+    type=str,
+    choices=["pertensor", "kv_blockscale"],
+    default="pertensor",
+    help="FP8 quantization method for batch_prefill. Default is pertensor.",
+)
 
 if __name__ == "__main__":
     args = parser.parse_args()
@@ -464,7 +578,7 @@ if __name__ == "__main__":
     modes = ALL_MODES if args.mode == "all" else [args.mode]
 
     if args.sweep:
-        run_sweep(args.dtype, modes)
+        run_sweep(args.dtype, modes, quant=args.quant)
     else:
         ps = problem_str(
             args.batch_size,
@@ -476,8 +590,15 @@ if __name__ == "__main__":
             args.logits_soft_cap,
         )
         is_fp8 = args.dtype == "fp8"
-        print_header()
+        # Remap batch_prefill mode based on quant method
+        effective_modes = []
         for mode in modes:
+            if mode == "batch_prefill" and args.quant == "kv_blockscale" and is_fp8:
+                effective_modes.append("batch_prefill_blockscale")
+            else:
+                effective_modes.append(mode)
+        print_header()
+        for mode in effective_modes:
             torch.manual_seed(0)
             torch.cuda.empty_cache()
             time_us = MODE_RUNNERS[mode](
@@ -503,4 +624,5 @@ if __name__ == "__main__":
                 ),
                 time_us,
             )
-            print_row(mode, args.dtype, ps, time_us, tf)
+            display_mode = "batch_prefill" if mode == "batch_prefill_blockscale" else mode
+            print_row(display_mode, args.dtype, ps, time_us, tf)
