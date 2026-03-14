@@ -3,7 +3,7 @@
 
 """
 Benchmark CK FMHA V3 kernels across all three paths:
-  1. batch_prefill  — paged KV (linear + sglang, page_size=1)
+  1. batch_prefill  — paged KV (linear layout)
   2. fmha_regular   — contiguous KV, batch/group mode (FP8 per-tensor)
   3. fmha_varlen    — contiguous KV, variable-length mode
 
@@ -16,8 +16,14 @@ Usage:
     # Compare all three modes side-by-side
     python op_tests/bench_fmha_v3.py -b 1 -n 6 -nk 1 -q 4096 -c --dtype fp8 --mode all
 
-    # Batch prefill only
-    python op_tests/bench_fmha_v3.py -b 1 -n 6 -nk 1 -q 4096 -c --dtype bf16 --mode batch_prefill
+    # Batch prefill only (ps=1, sglang, pertensor — default)
+    python op_tests/bench_fmha_v3.py -b 1 -n 6 -nk 1 -q 4096 -c --dtype fp8 --mode batch_prefill
+
+    # Batch prefill with vllm lookup table
+    python op_tests/bench_fmha_v3.py --sweep --dtype fp8 --mode batch_prefill --lookup_table vllm
+
+    # Batch prefill with page_size=1024 and blockscale
+    python op_tests/bench_fmha_v3.py --sweep --dtype fp8 --mode batch_prefill --quant kv_blockscale --page_size 1024
 
     # Sweep predefined problem sizes
     python op_tests/bench_fmha_v3.py --sweep --dtype fp8
@@ -37,6 +43,7 @@ from aiter.test_mha_common import (
 )
 
 from test_batch_prefill import (
+    build_block_table,
     build_paged_kv_cache,
     convert_lens_to_indptr,
     split_kv_pages,
@@ -70,10 +77,11 @@ def run_batch_prefill(
     causal,
     logits_soft_cap,
     is_fp8,
+    page_size=1,
+    kv_lookup_table="sglang",
 ):
     # Match fmha_varlen: padded Q + random padding mask + unpad
     dtype = torch.bfloat16
-    page_size = 1
 
     q_padded = torch.randn(
         batch_size, seqlen_q, nheads, head_dim, device="cuda", dtype=dtype
@@ -114,6 +122,20 @@ def run_batch_prefill(
     k_cache = k_cache_ref.contiguous()
     v_cache = v_cache_ref.contiguous()
 
+    # vllm lookup table uses block_table instead of kv_indices
+    block_table_gpu = None
+    seqlen_k_tensor = None
+    if kv_lookup_table == "vllm":
+        max_num_pages = (seqlen_k + page_size - 1) // page_size
+        block_table_cpu = build_block_table(
+            kv_cache["kv_indptr_cpu"],
+            kv_cache["kv_indices_cpu"],
+            batch_size,
+            max_num_pages,
+        )
+        block_table_gpu = block_table_cpu.cuda()
+        seqlen_k_tensor = kv_lens.cuda().int()
+
     if is_fp8:
         q_quant, q_descale = per_tensor_quant(q, quant_dtype=dtypes.fp8)
         k_quant, k_descale = per_tensor_quant(k_cache.to(dtype), quant_dtype=dtypes.fp8)
@@ -138,6 +160,8 @@ def run_batch_prefill(
             k_descale=k_descale,
             v_descale=v_descale,
             kv_last_page_lens=kv_last_page_len,
+            block_table=block_table_gpu,
+            seqlen_k=seqlen_k_tensor,
         )
     else:
         out, time_us = profile_func(
@@ -153,6 +177,8 @@ def run_batch_prefill(
             causal=causal,
             logits_soft_cap=logits_soft_cap,
             kv_last_page_lens=kv_last_page_len,
+            block_table=block_table_gpu,
+            seqlen_k=seqlen_k_tensor,
         )
 
     return time_us
@@ -168,10 +194,11 @@ def run_batch_prefill_blockscale(
     causal,
     logits_soft_cap,
     is_fp8,
+    page_size=1024,
+    kv_lookup_table="sglang",
 ):
     assert is_fp8, "kv_blockscale only supports fp8"
     dtype = torch.bfloat16
-    page_size = 1024
 
     q_padded = torch.randn(
         batch_size, seqlen_q, nheads, head_dim, device="cuda", dtype=dtype
@@ -181,9 +208,7 @@ def run_batch_prefill_blockscale(
     )
     qo_lens = query_padding_mask.sum(dim=-1).to(torch.int32).cpu()
     max_qo_len = qo_lens.max().item()
-    q = torch.cat(
-        [q_padded[i, : qo_lens[i]] for i in range(batch_size)], dim=0
-    )
+    q = torch.cat([q_padded[i, : qo_lens[i]] for i in range(batch_size)], dim=0)
 
     kv_lens = torch.full((batch_size,), seqlen_k).int()
 
@@ -266,9 +291,7 @@ def run_fmha_regular(
 ):
     dtype = torch.bfloat16
 
-    q = torch.randn(
-        batch_size, seqlen_q, nheads, head_dim, device="cuda", dtype=dtype
-    )
+    q = torch.randn(batch_size, seqlen_q, nheads, head_dim, device="cuda", dtype=dtype)
     k = torch.randn(
         batch_size, seqlen_k, nheads_k, head_dim, device="cuda", dtype=dtype
     )
@@ -419,6 +442,9 @@ MODE_RUNNERS = {
     "fmha_varlen": run_fmha_varlen,
 }
 
+# Modes that accept page_size / kv_lookup_table kwargs
+PAGED_MODES = {"batch_prefill", "batch_prefill_blockscale"}
+
 ALL_MODES = ["batch_prefill", "fmha_regular", "fmha_varlen"]
 
 
@@ -431,15 +457,30 @@ def print_row(mode, dtype_str, problem_str, time_us, tf):
     print(f"{mode:<16} {dtype_str:<5} {problem_str:<45} {time_us:>10.1f} {tf:>8.1f}")
 
 
-def problem_str(batch_size, nheads, nheads_k, seqlen_q, seqlen_k, causal, lsc):
+def problem_str(
+    batch_size,
+    nheads,
+    nheads_k,
+    seqlen_q,
+    seqlen_k,
+    causal,
+    lsc,
+    page_size=None,
+    kv_lookup_table=None,
+):
     c = "c" if causal else "nc"
     lsc_str = f" lsc={lsc}" if lsc > 0 else ""
-    return (
-        f"b={batch_size} h={nheads}/{nheads_k} sq={seqlen_q} sk={seqlen_k} {c}{lsc_str}"
-    )
+    paged_str = ""
+    if page_size is not None:
+        paged_str = f" ps={page_size}"
+        if kv_lookup_table is not None:
+            paged_str += f" {kv_lookup_table}"
+    return f"b={batch_size} h={nheads}/{nheads_k} sq={seqlen_q} sk={seqlen_k} {c}{lsc_str}{paged_str}"
 
 
-def run_sweep(dtype_str, modes, quant="pertensor"):
+def run_sweep(
+    dtype_str, modes, quant="pertensor", page_size=1, kv_lookup_table="sglang"
+):
     sweep_configs = [
         # (batch, nheads, nheads_k, seqlen_q, seqlen_k, causal, logits_soft_cap)
         (1, 6, 1, 1024, 1024, True, 0.0),
@@ -464,18 +505,31 @@ def run_sweep(dtype_str, modes, quant="pertensor"):
 
     print_header()
     for b, n, nk, sq, sk, causal, lsc in sweep_configs:
-        ps = problem_str(b, n, nk, sq, sk, causal, lsc)
         is_fp8 = dtype_str == "fp8"
         for mode in effective_modes:
+            # Only pass paged KV args to paged modes
+            paged_kwargs = {}
+            ps_display = None
+            lut_display = None
+            if mode in PAGED_MODES:
+                paged_kwargs = {
+                    "page_size": page_size,
+                    "kv_lookup_table": kv_lookup_table,
+                }
+                ps_display = page_size
+                lut_display = kv_lookup_table
+            ps_str = problem_str(b, n, nk, sq, sk, causal, lsc, ps_display, lut_display)
             torch.manual_seed(0)
             torch.cuda.empty_cache()
             time_us = MODE_RUNNERS[mode](
-                b, n, nk, sq, sk, 128, causal, lsc, is_fp8
+                b, n, nk, sq, sk, 128, causal, lsc, is_fp8, **paged_kwargs
             )
             tf = tflops(flops(b, sq, sk, 128, n, nk, causal), time_us)
             # Display original mode name (batch_prefill) for consistency
-            display_mode = "batch_prefill" if mode == "batch_prefill_blockscale" else mode
-            print_row(display_mode, dtype_str, ps, time_us, tf)
+            display_mode = (
+                "batch_prefill" if mode == "batch_prefill_blockscale" else mode
+            )
+            print_row(display_mode, dtype_str, ps_str, time_us, tf)
         if len(effective_modes) > 1:
             print()
 
@@ -490,7 +544,7 @@ parser.add_argument(
     choices=["batch_prefill", "fmha_regular", "fmha_varlen", "all"],
     default="all",
     help="""Kernel mode to benchmark. Default is 'all'.
-    batch_prefill  — paged KV (linear+sglang, page_size=1)
+    batch_prefill  — paged KV (use --page_size, --lookup_table, --quant to configure)
     fmha_regular   — contiguous KV, batch/group mode
     fmha_varlen    — contiguous KV, variable-length mode
     all            — run all three and compare""",
@@ -568,6 +622,19 @@ parser.add_argument(
     default="pertensor",
     help="FP8 quantization method for batch_prefill. Default is pertensor.",
 )
+parser.add_argument(
+    "--page_size",
+    type=int,
+    default=1,
+    help="Page size for batch_prefill. Default is 1.",
+)
+parser.add_argument(
+    "--lookup_table",
+    type=str,
+    choices=["sglang", "vllm"],
+    default="sglang",
+    help="KV lookup table layout for batch_prefill. Default is sglang.",
+)
 
 if __name__ == "__main__":
     args = parser.parse_args()
@@ -578,17 +645,14 @@ if __name__ == "__main__":
     modes = ALL_MODES if args.mode == "all" else [args.mode]
 
     if args.sweep:
-        run_sweep(args.dtype, modes, quant=args.quant)
-    else:
-        ps = problem_str(
-            args.batch_size,
-            args.nheads,
-            nheads_k,
-            args.seqlen_q,
-            seqlen_k,
-            args.causal,
-            args.logits_soft_cap,
+        run_sweep(
+            args.dtype,
+            modes,
+            quant=args.quant,
+            page_size=args.page_size,
+            kv_lookup_table=args.lookup_table,
         )
+    else:
         is_fp8 = args.dtype == "fp8"
         # Remap batch_prefill mode based on quant method
         effective_modes = []
@@ -599,6 +663,27 @@ if __name__ == "__main__":
                 effective_modes.append(mode)
         print_header()
         for mode in effective_modes:
+            paged_kwargs = {}
+            ps_display = None
+            lut_display = None
+            if mode in PAGED_MODES:
+                paged_kwargs = {
+                    "page_size": args.page_size,
+                    "kv_lookup_table": args.lookup_table,
+                }
+                ps_display = args.page_size
+                lut_display = args.lookup_table
+            ps = problem_str(
+                args.batch_size,
+                args.nheads,
+                nheads_k,
+                args.seqlen_q,
+                seqlen_k,
+                args.causal,
+                args.logits_soft_cap,
+                ps_display,
+                lut_display,
+            )
             torch.manual_seed(0)
             torch.cuda.empty_cache()
             time_us = MODE_RUNNERS[mode](
@@ -611,6 +696,7 @@ if __name__ == "__main__":
                 args.causal,
                 args.logits_soft_cap,
                 is_fp8,
+                **paged_kwargs,
             )
             tf = tflops(
                 flops(
@@ -624,5 +710,7 @@ if __name__ == "__main__":
                 ),
                 time_us,
             )
-            display_mode = "batch_prefill" if mode == "batch_prefill_blockscale" else mode
+            display_mode = (
+                "batch_prefill" if mode == "batch_prefill_blockscale" else mode
+            )
             print_row(display_mode, args.dtype, ps, time_us, tf)
