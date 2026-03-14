@@ -931,7 +931,6 @@
             "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'",
             "f'-DCK_TILE_ATTENTION_USE_SOFTSIGN_ASM={os.environ.get(\"CK_TILE_ATTENTION_USE_SOFTSIGN_ASM\", 1)}'",
             "'--save-temps'",
-            "'-mllvm --amdgpu-disable-packed-fp32=1'",
             "'-mllvm --greedy-reverse-local-assignment'"
         ],
         "extra_ldflags": "None",
