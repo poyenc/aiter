@@ -686,23 +686,24 @@ def test_flash_attn_fp8_output(
         profile=profile,
     )
 
-    out_ref = attention_fp8_ref_online(
-        q_quant,
-        k_quant,
-        v_quant,
-        q_descale.item(),
-        k_descale.item(),
-        v_descale.item(),
-        causal=causal,
-        window_size=window_size,
-        logits_soft_cap=logits_soft_cap,
-        kv_tile_size=kv_tile_size,
-    )
+    if not profile:
+        out_ref = attention_fp8_ref_online(
+            q_quant,
+            k_quant,
+            v_quant,
+            q_descale.item(),
+            k_descale.item(),
+            v_descale.item(),
+            causal=causal,
+            window_size=window_size,
+            logits_soft_cap=logits_soft_cap,
+            kv_tile_size=kv_tile_size,
+        )
 
-    max_diff = (out - out_ref).abs().max().item()
-    print(f"Output max diff: {max_diff}")
-    threshold = 0.025 if logits_soft_cap > 0.0 else 0.02
-    assert max_diff < threshold
+        max_diff = (out - out_ref).abs().max().item()
+        print(f"Output max diff: {max_diff}")
+        threshold = 0.025 if logits_soft_cap > 0.0 else 0.02
+        assert max_diff < threshold
 
     fwd_flop = (
         batch_size
@@ -821,27 +822,28 @@ def test_flash_attn_varlen_fp8_output(
         profile=profile,
     )
 
-    out_ref = attention_varlen_fp8_ref_online(
-        q_quant,
-        k_quant,
-        v_quant,
-        cu_seqlens_q.cpu(),
-        cu_seqlens_k.cpu(),
-        q_descale.item(),
-        k_descale.item(),
-        v_descale.item(),
-        causal=causal,
-        logits_soft_cap=logits_soft_cap,
-        kv_tile_size=kv_tile_size,
-    )
+    if not profile:
+        out_ref = attention_varlen_fp8_ref_online(
+            q_quant,
+            k_quant,
+            v_quant,
+            cu_seqlens_q.cpu(),
+            cu_seqlens_k.cpu(),
+            q_descale.item(),
+            k_descale.item(),
+            v_descale.item(),
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+            kv_tile_size=kv_tile_size,
+        )
 
-    max_diff = (out - out_ref).abs().max().item()
-    print(
-        f"Varlen FP8 | b={batch_size} sq={seqlen_q} sk={seqlen_k} "
-        f"h={nheads}/{nheads_k} causal={causal} lsc={logits_soft_cap} | "
-        f"max diff: {max_diff}"
-    )
-    assert max_diff < 0.02
+        max_diff = (out - out_ref).abs().max().item()
+        print(
+            f"Varlen FP8 | b={batch_size} sq={seqlen_q} sk={seqlen_k} "
+            f"h={nheads}/{nheads_k} causal={causal} lsc={logits_soft_cap} | "
+            f"max diff: {max_diff}"
+        )
+        assert max_diff < 0.02
 
     fwd_flop = (
         batch_size
