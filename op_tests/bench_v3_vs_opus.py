@@ -12,9 +12,8 @@ def flops(B, N, H, D, causal):
     return f // 2 if causal else f
 
 def bench_ck_v3(B, N, H, H_KV, D, causal, warmup=10, iters=50):
-    """Benchmark CK FMHA V3 via aiter flash_attn_func."""
-    import aiter
-    from aiter import flash_attn_func
+    """Benchmark CK FMHA V3 via aiter fmha_v3_fwd_ck_func."""
+    from aiter.ops.mha import fmha_v3_fwd_ck_func
 
     torch.manual_seed(0)
     q = torch.randn(B, N, H, D, dtype=torch.bfloat16, device="cuda")
@@ -23,7 +22,7 @@ def bench_ck_v3(B, N, H, H_KV, D, causal, warmup=10, iters=50):
 
     # warmup
     for _ in range(warmup):
-        _ = flash_attn_func(q, k, v, causal=causal)
+        _ = fmha_v3_fwd_ck_func(q, k, v, causal=causal)
     torch.cuda.synchronize()
 
     # timed
@@ -31,7 +30,7 @@ def bench_ck_v3(B, N, H, H_KV, D, causal, warmup=10, iters=50):
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     for i in range(iters):
         start_events[i].record()
-        _ = flash_attn_func(q, k, v, causal=causal)
+        _ = fmha_v3_fwd_ck_func(q, k, v, causal=causal)
         end_events[i].record()
     torch.cuda.synchronize()
 
