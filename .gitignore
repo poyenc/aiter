@@ -56,3 +56,7 @@ aiter_logs
 # artifacts
 aiter_meta
 aiter/install_mode
+.rocprofv3/
+pass_2
+opus_test
+*ui_output*
