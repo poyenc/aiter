@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Tuple
 from enum import Enum
 
-REF_BY_TORCH = False
+REF_BY_TORCH = True
 REF_BY_TRITON = False
 
 if not REF_BY_TORCH:
