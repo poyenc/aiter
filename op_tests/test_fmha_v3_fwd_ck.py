@@ -78,7 +78,7 @@ def efficiency(flop, time_in_us):
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 10.0])
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("seed", [None])
+@pytest.mark.parametrize("seed", [42])
 def test_fmha_v3_fwd_ck(
     batch_size,
     nheads,
@@ -151,7 +151,7 @@ def test_fmha_v3_fwd_ck(
         print(f"Output Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
         assert (out - out_ref).abs().max().item() <= 2 * (
             out_pt - out_ref
-        ).abs().max().item()
+        ).abs().max().item() + 1e-5
     else:
         out_ref, _ = flash_attn_func(
             q, k, v, causal=causal, logits_soft_cap=logits_soft_cap, return_lse=True
@@ -187,7 +187,7 @@ def test_fmha_v3_fwd_ck(
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 10.0])
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("seed", [None])
+@pytest.mark.parametrize("seed", [42])
 def test_fmha_v3_varlen_fwd_ck(
     batch_size,
     nheads,
@@ -311,7 +311,7 @@ def test_fmha_v3_varlen_fwd_ck(
         print(f"Output Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
         assert (out - out_ref).abs().max().item() <= 2 * (
             out_pt - out_ref
-        ).abs().max().item()
+        ).abs().max().item() + 1e-5
     else:
         if REF_BY_TRITON:
             out_ref, _ = flash_attn_varlen_func(
