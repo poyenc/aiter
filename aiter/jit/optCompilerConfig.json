@@ -1233,7 +1233,8 @@
             "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'",
             "'--save-temps'",
             "'-mllvm --amdgpu-disable-packed-fp32=1'",
-            "'-mllvm --greedy-reverse-local-assignment'"
+            "'-mllvm --greedy-reverse-local-assignment'",
+            "'-mllvm -amdgpu-mfma-vgpr-form'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -1273,7 +1274,8 @@
             "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'",
             "'--save-temps'",
             "'-mllvm --amdgpu-disable-packed-fp32=1'",
-            "'-mllvm --greedy-reverse-local-assignment'"
+            "'-mllvm --greedy-reverse-local-assignment'",
+            "'-mllvm -amdgpu-mfma-vgpr-form'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
